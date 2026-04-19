@@ -1639,6 +1639,107 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     return [{"day": d[5:], "profit": round(v, 2)} for d, v in ordered]
 
 
+def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=200):
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT
+        o.order_id,
+        o.order_price,
+        o.order_status,
+        o.status_name,
+        o.order_create_time,
+        o.app_id,
+        o.asset_id,
+        o.name,
+        o.market_hash_name,
+        o.steam_id AS order_steam_id,
+        ah.steam_id AS owner_steam_id,
+        COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
+        a.nickname,
+        a.username,
+        COALESCE(p.purchase_price, 0) AS item_purchase_price,
+        COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(iv.cost_price, 0) AS inventory_cost_price
+    FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
+    LEFT JOIN steam_accounts a
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
+    LEFT JOIN item_purchase_prices p
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = p.steam_id
+     AND o.app_id = p.app_id
+     AND o.asset_id = p.asset_id
+    LEFT JOIN group_purchase_prices g
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = g.steam_id
+     AND o.app_id = g.app_id
+     AND o.name = g.group_name
+    LEFT JOIN inventory_items iv
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
+    WHERE o.app_id = ?
+      AND o.asset_id = ?
+    ORDER BY o.order_create_time DESC, o.order_id DESC
+    LIMIT ?
+    """, (str(app_id), asset_id, max(1, int(limit or 200))))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    result = []
+    for row in rows:
+        item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        group_cost = safe_float(row.get("group_purchase_price", 0), 0)
+        inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+
+        if item_cost > 0:
+            cost_source = "单品成本(item_purchase_prices)"
+            hit_cost = item_cost
+        elif group_cost > 0:
+            cost_source = "分组成本(group_purchase_prices)"
+            hit_cost = group_cost
+        elif inventory_cost > 0:
+            cost_source = "库存成本(inventory_items.cost_price)"
+            hit_cost = inventory_cost
+        else:
+            cost_source = "未命中成本"
+            hit_cost = 0
+
+        order_price = safe_float(row.get("order_price", 0), 0)
+        profit = order_price - hit_cost
+
+        result.append({
+            "order_id": str(row.get("order_id", "") or ""),
+            "order_create_time": int(row.get("order_create_time", 0) or 0),
+            "order_create_time_str": unix_ms_to_str(row.get("order_create_time", 0)),
+            "order_status": int(row.get("order_status", 0) or 0),
+            "status_name": str(row.get("status_name", "") or ""),
+            "name": row.get("name", ""),
+            "market_hash_name": row.get("market_hash_name", ""),
+            "asset_id": str(row.get("asset_id", "") or ""),
+            "app_id": str(row.get("app_id", "") or ""),
+            "order_price": order_price,
+            "order_steam_id": str(row.get("order_steam_id", "") or ""),
+            "owner_steam_id": str(row.get("owner_steam_id", "") or ""),
+            "resolved_steam_id": str(row.get("resolved_steam_id", "") or ""),
+            "nickname": row.get("nickname", ""),
+            "username": row.get("username", ""),
+            "item_purchase_price": item_cost,
+            "group_purchase_price": group_cost,
+            "inventory_cost_price": inventory_cost,
+            "hit_cost": hit_cost,
+            "cost_source": cost_source,
+            "profit": profit,
+        })
+
+    return result
+
+
 def build_profit_summary(rows):
     total_orders = len(rows)
     counted_rows = [x for x in rows if x.get("counted_in_profit")]
@@ -3064,6 +3165,7 @@ PROFIT_ANALYSIS_TEMPLATE = """
             </form>
 
             <a class="btn" href="/sync/profit_orders">同步利润订单</a>
+            <a class="btn" href="/profit_debug?appId={{ app_id }}">利润诊断</a>
             <a class="btn" href="/">返回主页面</a>
         </div>
     </div>
@@ -3517,6 +3619,98 @@ def profit_analysis_page():
         error=error,
         profit_sync_status=profit_sync_status
     )
+
+
+@app.route("/profit_debug")
+def profit_debug_page():
+    app_id = request.args.get("appId", DEFAULT_APP_ID).strip() or DEFAULT_APP_ID
+    asset_id = request.args.get("asset_id", "").strip()
+    limit = request.args.get("limit", "100").strip()
+    msg = request.args.get("msg", "").strip()
+
+    try:
+        safe_limit = min(max(int(limit or 100), 1), 500)
+    except Exception:
+        safe_limit = 100
+
+    rows = []
+    if asset_id:
+        rows = get_profit_diagnostics_by_asset_id(asset_id=asset_id, app_id=app_id, limit=safe_limit)
+        if not rows:
+            msg = "未查到该 asset_id 的订单记录，或该记录暂无可用成本信息。"
+
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>利润诊断</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { margin:0; font-family: "Microsoft YaHei", Arial, sans-serif; background:#0b1220; color:#e5eefc; }
+        .container { max-width: 1800px; margin: 0 auto; padding: 24px; }
+        .toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
+        .input { padding:10px 12px; border-radius:10px; border:1px solid #2b3d59; background:#101a2b; color:#e5eefc; }
+        .btn { text-decoration:none; color:white; background:#2563eb; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; display:inline-block; }
+        .btn.gray { background:#475569; }
+        .msg { margin: 10px 0; padding: 12px; border-radius: 10px; background:#172554; color:#c7d2fe; }
+        .card { background:#111b2d; border:1px solid #27354a; border-radius:14px; padding:14px; margin-bottom:10px; }
+        .row { display:flex; flex-wrap:wrap; gap:10px 20px; }
+        .k { color:#8ca3c7; font-size:12px; }
+        .v { font-size:14px; font-weight:700; }
+        .ok { color:#86efac; }
+        .warn { color:#fca5a5; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2 style="margin-top:0;">利润诊断 / 调试输出</h2>
+    <div style="color:#8ca3c7; margin-bottom:14px;">输入 asset_id，查看每笔订单的卖出价、回溯账号、命中成本来源和利润计算过程。</div>
+
+    <form class="toolbar" method="get" action="/profit_debug">
+        <input class="input" type="text" name="appId" value="{{ app_id }}" placeholder="appId">
+        <input class="input" type="text" name="asset_id" value="{{ asset_id }}" placeholder="asset_id">
+        <input class="input" type="number" name="limit" min="1" max="500" value="{{ limit }}" placeholder="limit">
+        <button class="btn" type="submit">开始诊断</button>
+        <a class="btn gray" href="/profit_analysis?appId={{ app_id }}">返回利润分析</a>
+    </form>
+
+    {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+
+    {% if rows %}
+        <div style="margin-bottom:12px; color:#8ca3c7;">共 {{ rows|length }} 条结果（asset_id={{ asset_id }}）</div>
+        {% for r in rows %}
+        <div class="card">
+            <div class="row">
+                <div><div class="k">订单号</div><div class="v">{{ r.order_id }}</div></div>
+                <div><div class="k">时间</div><div class="v">{{ r.order_create_time_str }}</div></div>
+                <div><div class="k">订单状态</div><div class="v">{{ r.status_name }} ({{ r.order_status }})</div></div>
+                <div><div class="k">卖出价</div><div class="v">¥ {{ "%.2f"|format(r.order_price) }}</div></div>
+                <div><div class="k">利润</div><div class="v {{ 'ok' if r.profit >= 0 else 'warn' }}">¥ {{ "%.2f"|format(r.profit) }}</div></div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+                <div><div class="k">asset_id</div><div class="v">{{ r.asset_id }}</div></div>
+                <div><div class="k">订单内 steam_id</div><div class="v">{{ r.order_steam_id or '-' }}</div></div>
+                <div><div class="k">归属历史 steam_id</div><div class="v">{{ r.owner_steam_id or '-' }}</div></div>
+                <div><div class="k">最终回溯 steam_id</div><div class="v">{{ r.resolved_steam_id or '-' }}</div></div>
+                <div><div class="k">账号</div><div class="v">{{ r.nickname or '-' }} {% if r.username %}({{ r.username }}){% endif %}</div></div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+                <div><div class="k">单品成本</div><div class="v">¥ {{ "%.2f"|format(r.item_purchase_price) }}</div></div>
+                <div><div class="k">分组成本</div><div class="v">¥ {{ "%.2f"|format(r.group_purchase_price) }}</div></div>
+                <div><div class="k">库存成本</div><div class="v">¥ {{ "%.2f"|format(r.inventory_cost_price) }}</div></div>
+                <div><div class="k">命中成本来源</div><div class="v">{{ r.cost_source }}</div></div>
+                <div><div class="k">命中成本价</div><div class="v">¥ {{ "%.2f"|format(r.hit_cost) }}</div></div>
+            </div>
+        </div>
+        {% endfor %}
+    {% elif asset_id %}
+        <div class="msg">没有查到可展示的数据。</div>
+    {% endif %}
+</div>
+</body>
+</html>
+    """, app_id=app_id, asset_id=asset_id, limit=safe_limit, rows=rows, msg=msg)
 
 
 @app.route("/inventory/<steam_id>")
