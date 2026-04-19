@@ -963,6 +963,141 @@ def build_asset_owner_map(app_id=DEFAULT_APP_ID):
     return owner_map
 
 
+def lookup_resolved_steam_id_by_asset(app_id, asset_id):
+    app_id = str(app_id or "").strip()
+    asset_id = str(asset_id or "").strip()
+    if not app_id or not asset_id:
+        return "", "none"
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # 1) 先查归属历史（最稳定）
+    cur.execute("""
+    SELECT steam_id
+    FROM asset_ownership_history
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY last_seen_at DESC
+    LIMIT 1
+    """, (app_id, asset_id))
+    row = cur.fetchone()
+    if row and str(row["steam_id"] or "").strip():
+        conn.close()
+        return str(row["steam_id"]).strip(), "asset_ownership_history"
+
+    # 2) 再查当前库存（仍持有该 asset 的账号）
+    cur.execute("""
+    SELECT steam_id
+    FROM inventory_items
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, asset_id))
+    row = cur.fetchone()
+    if row and str(row["steam_id"] or "").strip():
+        conn.close()
+        return str(row["steam_id"]).strip(), "inventory_items"
+
+    # 3) 最后查已沉淀的单品成本记录（说明这个 asset 曾经被某账号标过成本）
+    cur.execute("""
+    SELECT steam_id
+    FROM item_purchase_prices
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, asset_id))
+    row = cur.fetchone()
+    conn.close()
+    if row and str(row["steam_id"] or "").strip():
+        return str(row["steam_id"]).strip(), "item_purchase_prices"
+
+    return "", "none"
+
+
+def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id=""):
+    app_id = str(app_id or "").strip()
+    asset_id = str(asset_id or "").strip()
+    steam_id = str(steam_id or "").strip()
+    if not app_id or not asset_id:
+        return 0.0
+
+    conn = get_conn()
+    cur = conn.cursor()
+    if steam_id:
+        cur.execute("""
+        SELECT purchase_price
+        FROM item_purchase_prices
+        WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+        LIMIT 1
+        """, (steam_id, app_id, asset_id))
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return safe_float(row["purchase_price"], 0)
+
+    cur.execute("""
+    SELECT purchase_price
+    FROM item_purchase_prices
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, asset_id))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return 0.0
+    return safe_float(row["purchase_price"], 0)
+
+
+def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id=""):
+    app_id = str(app_id or "").strip()
+    asset_id = str(asset_id or "").strip()
+    steam_id = str(steam_id or "").strip()
+    if not app_id or not asset_id:
+        return 0.0
+
+    conn = get_conn()
+    cur = conn.cursor()
+    if steam_id:
+        cur.execute("""
+        SELECT cost_price
+        FROM inventory_items
+        WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+        LIMIT 1
+        """, (steam_id, app_id, asset_id))
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return safe_float(row["cost_price"], 0)
+
+    cur.execute("""
+    SELECT cost_price
+    FROM inventory_items
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, asset_id))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return 0.0
+    return safe_float(row["cost_price"], 0)
+
+
+def lookup_account_name(steam_id):
+    steam_id = str(steam_id or "").strip()
+    if not steam_id:
+        return "", ""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT nickname, username FROM steam_accounts WHERE steam_id = ? LIMIT 1", (steam_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return "", ""
+    return row["nickname"] or "", row["username"] or ""
+
+
 def upsert_asset_owner(cur, app_id, asset_id, steam_id, current_time):
     cur.execute("""
     INSERT INTO asset_ownership_history (app_id, asset_id, steam_id, first_seen_at, last_seen_at)
@@ -1039,6 +1174,9 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                     continue
                 if not steam_id and asset_id:
                     steam_id = asset_owner_map.get(asset_id, "")
+                if steam_id and asset_id:
+                    upsert_asset_owner(cur, app_id=app_id, asset_id=asset_id, steam_id=steam_id, current_time=current_time)
+                    asset_owner_map[asset_id] = steam_id
 
                 # 增量同步：遇到上次同步边界数据后，提前终止后续翻页
                 if last_synced_time > 0:
@@ -1488,21 +1626,42 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     result = []
 
     for row in rows:
+        resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
+        asset_id = str(row.get("asset_id", "") or "").strip()
+        row_app_id = str(row.get("app_id", "") or "").strip()
+        item_name = str(row.get("name", "") or "")
+
+        if not resolved_steam_id and asset_id:
+            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id)
+
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        if item_cost <= 0 and asset_id:
+            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id)
+
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
+        if group_cost <= 0 and resolved_steam_id and item_name:
+            group_cost = get_group_default_purchase_price(resolved_steam_id, row_app_id, item_name)
+
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        if inventory_cost <= 0 and asset_id:
+            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id)
         cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
 
         order_price = safe_float(row.get("order_price", 0), 0)
         profit = order_price - cost_price
         counted_in_profit = cost_price > 0
 
+        nickname = row.get("nickname", "")
+        username = row.get("username", "")
+        if resolved_steam_id and (not nickname and not username):
+            nickname, username = lookup_account_name(resolved_steam_id)
+
         record = {
             "order_id": str(row.get("order_id", "") or ""),
-            "steam_id": str(row.get("resolved_steam_id", "") or ""),
+            "steam_id": resolved_steam_id,
             "product_id": str(row.get("product_id", "") or ""),
             "app_id": str(row.get("app_id", "") or ""),
-            "name": row.get("name", ""),
+            "name": item_name,
             "market_hash_name": row.get("market_hash_name", ""),
             "image_url": cache_image_and_get_local_url(row.get("image_url", "")),
             "order_price": order_price,
@@ -1510,13 +1669,13 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
             "status_name": row.get("status_name", ""),
             "order_create_time": int(row.get("order_create_time", 0) or 0),
             "order_create_time_str": unix_ms_to_str(row.get("order_create_time", 0)),
-            "asset_id": str(row.get("asset_id", "") or ""),
+            "asset_id": asset_id,
             "style_id": str(row.get("style_id", "") or ""),
             "wear": str(row.get("wear", "") or ""),
             "weapon_name": row.get("weapon_name", ""),
             "exterior_name": row.get("exterior_name", ""),
-            "nickname": row.get("nickname", ""),
-            "username": row.get("username", ""),
+            "nickname": nickname,
+            "username": username,
             "cost_price": cost_price,
             "profit": profit,
             "counted_in_profit": counted_in_profit,
@@ -1617,9 +1776,25 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
 
     daily = defaultdict(float)
     for row in rows:
+        resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
+        asset_id = str(row.get("asset_id", "") or "").strip()
+        row_app_id = str(app_id or "")
+        item_name = str(row.get("name", "") or "")
+
+        if not resolved_steam_id and asset_id:
+            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id)
+
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        if item_cost <= 0 and asset_id:
+            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id)
+
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
+        if group_cost <= 0 and resolved_steam_id and item_name:
+            group_cost = get_group_default_purchase_price(resolved_steam_id, row_app_id, item_name)
+
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        if inventory_cost <= 0 and asset_id:
+            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id)
         cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
         if cost_price <= 0:
             continue
@@ -1693,9 +1868,26 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
 
     result = []
     for row in rows:
+        row_app_id = str(row.get("app_id", "") or "").strip()
+        row_asset_id = str(row.get("asset_id", "") or "").strip()
+        row_name = str(row.get("name", "") or "")
+        resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
+        resolve_source = "order_or_history"
+
+        if not resolved_steam_id and row_asset_id:
+            resolved_steam_id, resolve_source = lookup_resolved_steam_id_by_asset(row_app_id, row_asset_id)
+
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        if item_cost <= 0 and row_asset_id:
+            item_cost = lookup_item_purchase_price_by_asset(row_app_id, row_asset_id, resolved_steam_id)
+
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
+        if group_cost <= 0 and resolved_steam_id and row_name:
+            group_cost = get_group_default_purchase_price(resolved_steam_id, row_app_id, row_name)
+
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        if inventory_cost <= 0 and row_asset_id:
+            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, row_asset_id, resolved_steam_id)
 
         if item_cost > 0:
             cost_source = "单品成本(item_purchase_prices)"
@@ -1713,6 +1905,11 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
         order_price = safe_float(row.get("order_price", 0), 0)
         profit = order_price - hit_cost
 
+        nickname = row.get("nickname", "")
+        username = row.get("username", "")
+        if resolved_steam_id and (not nickname and not username):
+            nickname, username = lookup_account_name(resolved_steam_id)
+
         result.append({
             "order_id": str(row.get("order_id", "") or ""),
             "order_create_time": int(row.get("order_create_time", 0) or 0),
@@ -1721,14 +1918,15 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
             "status_name": str(row.get("status_name", "") or ""),
             "name": row.get("name", ""),
             "market_hash_name": row.get("market_hash_name", ""),
-            "asset_id": str(row.get("asset_id", "") or ""),
+            "asset_id": row_asset_id,
             "app_id": str(row.get("app_id", "") or ""),
             "order_price": order_price,
             "order_steam_id": str(row.get("order_steam_id", "") or ""),
             "owner_steam_id": str(row.get("owner_steam_id", "") or ""),
-            "resolved_steam_id": str(row.get("resolved_steam_id", "") or ""),
-            "nickname": row.get("nickname", ""),
-            "username": row.get("username", ""),
+            "resolved_steam_id": resolved_steam_id,
+            "resolve_source": resolve_source,
+            "nickname": nickname,
+            "username": username,
             "item_purchase_price": item_cost,
             "group_purchase_price": group_cost,
             "inventory_cost_price": inventory_cost,
@@ -3693,6 +3891,7 @@ def profit_debug_page():
                 <div><div class="k">订单内 steam_id</div><div class="v">{{ r.order_steam_id or '-' }}</div></div>
                 <div><div class="k">归属历史 steam_id</div><div class="v">{{ r.owner_steam_id or '-' }}</div></div>
                 <div><div class="k">最终回溯 steam_id</div><div class="v">{{ r.resolved_steam_id or '-' }}</div></div>
+                <div><div class="k">回溯来源</div><div class="v">{{ r.resolve_source or '-' }}</div></div>
                 <div><div class="k">账号</div><div class="v">{{ r.nickname or '-' }} {% if r.username %}({{ r.username }}){% endif %}</div></div>
             </div>
             <div class="row" style="margin-top:10px;">
