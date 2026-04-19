@@ -337,6 +337,17 @@ def init_db():
         UNIQUE(app_id, asset_id)
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS asset_ownership_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        steam_id TEXT NOT NULL,
+        first_seen_at TEXT,
+        last_seen_at TEXT,
+        UNIQUE(app_id, asset_id, steam_id)
+    )
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS item_purchase_prices (
@@ -383,6 +394,8 @@ def init_db():
         wear TEXT,
         weapon_name TEXT,
         exterior_name TEXT,
+        cost_price_snapshot REAL DEFAULT 0,
+        cost_source TEXT DEFAULT '',
         updated_at TEXT
     )
     """)
@@ -407,6 +420,26 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_asset_ownership_app_asset
     ON asset_ownership_history (app_id, asset_id)
     """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_asset_ownership_journal_lookup
+    ON asset_ownership_journal (app_id, asset_id, last_seen_at DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_item_purchase_prices_lookup
+    ON item_purchase_prices (steam_id, app_id, asset_id)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_group_purchase_prices_lookup
+    ON group_purchase_prices (steam_id, app_id, group_name)
+    """)
+
+    # 兼容旧库：为 seller_orders 增加成本快照字段
+    cur.execute("PRAGMA table_info(seller_orders)")
+    seller_cols = {str(r["name"]) for r in cur.fetchall()}
+    if "cost_price_snapshot" not in seller_cols:
+        cur.execute("ALTER TABLE seller_orders ADD COLUMN cost_price_snapshot REAL DEFAULT 0")
+    if "cost_source" not in seller_cols:
+        cur.execute("ALTER TABLE seller_orders ADD COLUMN cost_source TEXT DEFAULT ''")
 
     conn.commit()
     conn.close()
@@ -918,10 +951,10 @@ def build_asset_owner_map(app_id=DEFAULT_APP_ID):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-    SELECT asset_id, steam_id
-    FROM asset_ownership_history
+    SELECT asset_id, steam_id, last_seen_at
+    FROM asset_ownership_journal
     WHERE app_id = ? AND asset_id IS NOT NULL AND asset_id != ''
-    ORDER BY last_seen_at DESC
+    ORDER BY last_seen_at DESC, id DESC
     """, (str(app_id),))
     rows = cur.fetchall()
     conn.close()
@@ -936,6 +969,7 @@ def build_asset_owner_map(app_id=DEFAULT_APP_ID):
 
 
 def upsert_asset_owner(cur, app_id, asset_id, steam_id, current_time):
+    # 兼容旧逻辑：保留最近一次 owner（单行）
     cur.execute("""
     INSERT INTO asset_ownership_history (app_id, asset_id, steam_id, first_seen_at, last_seen_at)
     VALUES (?, ?, ?, ?, ?)
@@ -943,6 +977,75 @@ def upsert_asset_owner(cur, app_id, asset_id, steam_id, current_time):
         steam_id=excluded.steam_id,
         last_seen_at=excluded.last_seen_at
     """, (str(app_id), str(asset_id), str(steam_id), current_time, current_time))
+    # 新逻辑：为每个 steam_id 保留独立归属轨迹，支持“卖出后又买入”场景
+    cur.execute("""
+    INSERT INTO asset_ownership_journal (app_id, asset_id, steam_id, first_seen_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(app_id, asset_id, steam_id) DO UPDATE SET
+        last_seen_at=excluded.last_seen_at
+    """, (str(app_id), str(asset_id), str(steam_id), current_time, current_time))
+
+
+def resolve_owner_by_asset(cur, app_id, asset_id, order_create_time=0):
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        return ""
+
+    order_dt = unix_ms_to_str(order_create_time) if int(order_create_time or 0) > 0 else ""
+    if order_dt:
+        cur.execute("""
+        SELECT steam_id
+        FROM asset_ownership_journal
+        WHERE app_id = ? AND asset_id = ?
+          AND first_seen_at <= ?
+        ORDER BY
+          CASE WHEN last_seen_at >= ? THEN 0 ELSE 1 END ASC,
+          last_seen_at DESC
+        LIMIT 1
+        """, (str(app_id), asset_id, order_dt, order_dt))
+    else:
+        cur.execute("""
+        SELECT steam_id
+        FROM asset_ownership_journal
+        WHERE app_id = ? AND asset_id = ?
+        ORDER BY last_seen_at DESC, id DESC
+        LIMIT 1
+        """, (str(app_id), asset_id))
+
+    row = cur.fetchone()
+    return str(row["steam_id"] or "").strip() if row else ""
+
+
+def resolve_cost_snapshot(cur, steam_id, app_id, asset_id, item_name):
+    steam_id = str(steam_id or "").strip()
+    if not steam_id:
+        return 0.0, ""
+
+    cur.execute("""
+    SELECT purchase_price
+    FROM item_purchase_prices
+    WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+    LIMIT 1
+    """, (steam_id, str(app_id), str(asset_id)))
+    row = cur.fetchone()
+    if row:
+        item_cost = safe_float(row["purchase_price"], 0)
+        if item_cost > 0:
+            return item_cost, "item"
+
+    cur.execute("""
+    SELECT default_purchase_price
+    FROM group_purchase_prices
+    WHERE steam_id = ? AND app_id = ? AND group_name = ?
+    LIMIT 1
+    """, (steam_id, str(app_id), str(item_name or "")))
+    row = cur.fetchone()
+    if row:
+        group_cost = safe_float(row["default_purchase_price"], 0)
+        if group_cost > 0:
+            return group_cost, "group"
+
+    return 0.0, ""
 
 
 def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
@@ -953,7 +1056,6 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
     max_pages = 200
     processed_orders = 0
     new_orders = 0
-    asset_owner_map = build_asset_owner_map(app_id=app_id)
 
     checkpoint_time_key = f"profit_sync_last_order_create_time:{app_id}:{status}"
     checkpoint_id_key = f"profit_sync_last_order_id:{app_id}:{status}"
@@ -1010,7 +1112,15 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 if not order_id:
                     continue
                 if not steam_id and asset_id:
-                    steam_id = asset_owner_map.get(asset_id, "")
+                    steam_id = resolve_owner_by_asset(cur, app_id=app_id, asset_id=asset_id, order_create_time=order_create_time)
+
+                cost_price_snapshot, cost_source = resolve_cost_snapshot(
+                    cur,
+                    steam_id=steam_id,
+                    app_id=app_id,
+                    asset_id=asset_id,
+                    item_name=name
+                )
 
                 # 增量同步：遇到上次同步边界数据后，提前终止后续翻页
                 if last_synced_time > 0:
@@ -1025,9 +1135,10 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 INSERT INTO seller_orders (
                     order_id, steam_id, product_id, app_id, item_id, name, market_hash_name,
                     image_url, order_price, order_status, status_name, order_create_time,
-                    asset_id, style_id, wear, weapon_name, exterior_name, updated_at
+                    asset_id, style_id, wear, weapon_name, exterior_name,
+                    cost_price_snapshot, cost_source, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     steam_id=excluded.steam_id,
                     product_id=excluded.product_id,
@@ -1045,11 +1156,22 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                     wear=excluded.wear,
                     weapon_name=excluded.weapon_name,
                     exterior_name=excluded.exterior_name,
+                    cost_price_snapshot=CASE
+                        WHEN seller_orders.cost_price_snapshot IS NULL OR seller_orders.cost_price_snapshot <= 0
+                        THEN excluded.cost_price_snapshot
+                        ELSE seller_orders.cost_price_snapshot
+                    END,
+                    cost_source=CASE
+                        WHEN seller_orders.cost_source IS NULL OR seller_orders.cost_source = ''
+                        THEN excluded.cost_source
+                        ELSE seller_orders.cost_source
+                    END,
                     updated_at=excluded.updated_at
                 """, (
                     order_id, steam_id, product_id, str(app_id), item_id, name, market_hash_name,
                     image_url, order_price, order_status, status_name, order_create_time,
-                    asset_id, style_id, wear, weapon_name, exterior_name, current_time
+                    asset_id, style_id, wear, weapon_name, exterior_name,
+                    cost_price_snapshot, cost_source, current_time
                 ))
                 processed_orders += 1
                 new_orders += 1
@@ -1086,15 +1208,11 @@ def reconcile_order_owners_by_asset(app_id=DEFAULT_APP_ID, status="10"):
     """
     对已存在但 steam_id 为空的订单，按 asset_id 从归属历史回填账号。
     """
-    owner_map = build_asset_owner_map(app_id=app_id)
-    if not owner_map:
-        return 0
-
     conn = get_conn()
     cur = conn.cursor()
     params = [str(app_id)]
     sql = """
-    SELECT order_id, asset_id
+    SELECT order_id, asset_id, order_create_time
     FROM seller_orders
     WHERE app_id = ?
       AND (steam_id IS NULL OR steam_id = '')
@@ -1109,7 +1227,8 @@ def reconcile_order_owners_by_asset(app_id=DEFAULT_APP_ID, status="10"):
     for r in rows:
         order_id = str(r["order_id"] or "")
         asset_id = str(r["asset_id"] or "")
-        steam_id = owner_map.get(asset_id, "")
+        order_create_time = int(r["order_create_time"] or 0)
+        steam_id = resolve_owner_by_asset(cur, app_id=app_id, asset_id=asset_id, order_create_time=order_create_time)
         if not order_id or not steam_id:
             continue
         cur.execute("UPDATE seller_orders SET steam_id = ? WHERE order_id = ?", (steam_id, order_id))
@@ -1346,6 +1465,8 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         o.wear,
         o.weapon_name,
         o.exterior_name,
+        COALESCE(o.cost_price_snapshot, 0) AS cost_price_snapshot,
+        COALESCE(o.cost_source, '') AS cost_source,
         a.nickname,
         a.username,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
@@ -1430,9 +1551,10 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     result = []
 
     for row in rows:
+        snapshot_cost = safe_float(row.get("cost_price_snapshot", 0), 0)
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
-        cost_price = item_cost if item_cost > 0 else group_cost
+        cost_price = snapshot_cost if snapshot_cost > 0 else (item_cost if item_cost > 0 else group_cost)
 
         order_price = safe_float(row.get("order_price", 0), 0)
         profit = order_price - cost_price
@@ -1478,6 +1600,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         o.order_price,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
         COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(o.cost_price_snapshot, 0) AS cost_price_snapshot,
         o.name,
         o.market_hash_name,
         o.asset_id,
@@ -1550,9 +1673,10 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
 
     daily = defaultdict(float)
     for row in rows:
+        snapshot_cost = safe_float(row.get("cost_price_snapshot", 0), 0)
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
-        cost_price = item_cost if item_cost > 0 else group_cost
+        cost_price = snapshot_cost if snapshot_cost > 0 else (item_cost if item_cost > 0 else group_cost)
         if cost_price <= 0:
             continue
 
