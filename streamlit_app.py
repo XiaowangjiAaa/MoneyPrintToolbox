@@ -1864,7 +1864,7 @@ INVENTORY_TEMPLATE = """
                      data-cost="{{ row.total_cost }}">
                     <div>
                         <img class="summary-img"
-                             src="{{ row.image_url }}"
+                             src="{{ row.image_url or 'https://via.placeholder.com/80x64?text=No+Img' }}"
                              alt="summary image"
                              onerror="this.src='https://via.placeholder.com/80x64?text=No+Img'">
                     </div>
@@ -1951,7 +1951,7 @@ INVENTORY_TEMPLATE = """
                      data-cost="{{ item.purchase_price }}">
                     <div>
                         <img class="detail-img"
-                             src="{{ item.image_url }}"
+                             src="{{ item.image_url or 'https://via.placeholder.com/90x72?text=No+Img' }}"
                              alt="item image"
                              onerror="this.src='https://via.placeholder.com/90x72?text=No+Img'">
                     </div>
@@ -2404,7 +2404,7 @@ ALL_INVENTORY_TEMPLATE = """
             {% for item in items %}
             <div class="row">
                 <div>
-                    <img class="img" src="{{ item.image_url }}" alt="item"
+                    <img class="img" src="{{ item.image_url or 'https://via.placeholder.com/80x64?text=No+Img' }}" alt="item"
                          onerror="this.src='https://via.placeholder.com/80x64?text=No+Img'">
                 </div>
 
@@ -2733,7 +2733,7 @@ PROFIT_ANALYSIS_TEMPLATE = """
                 {% for row in profit_rows %}
                 <div class="row order-row">
                     <div>
-                        <img class="img" src="{{ row.image_url }}" alt="item"
+                        <img class="img" src="{{ row.image_url or 'https://via.placeholder.com/80x64?text=No+Img' }}" alt="item"
                              onerror="this.src='https://via.placeholder.com/80x64?text=No+Img'">
                     </div>
 
@@ -2967,7 +2967,7 @@ def sync_profit_orders():
 
 @app.route("/profit_analysis")
 def profit_analysis_page():
-    sync_status = {}
+    sync_status = get_sync_state()
     app_id = request.args.get("appId", DEFAULT_APP_ID)
     keyword = request.args.get("q", "").strip()
     selected_steam_id = request.args.get("steam_id", "").strip()
@@ -3000,7 +3000,7 @@ def inventory_page(steam_id):
     selected_name = request.args.get("name", "").strip()
     inventory_filter = request.args.get("inventory_filter", "all").strip()
 
-    sync_status = get_sync_status()
+    sync_status = get_sync_state()
 
     items = get_inventory_from_db(steam_id, app_id=app_id)
 
