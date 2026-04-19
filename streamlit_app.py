@@ -2,11 +2,15 @@
 import http.client
 import json
 import sqlite3
+import time
+import hashlib
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from collections import defaultdict
 import threading
 import os
-from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify, send_from_directory, abort
 
 app = Flask(__name__)
 
@@ -26,6 +30,7 @@ APP_KEY = load_config()
 DEFAULT_APP_ID = "730"
 DB_PATH = "steam_inventory_app.db"
 FAILED_SYNC_FILE = "failed_inventory_sync.json"
+IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cached_images")
 
 
 # =========================
@@ -49,6 +54,25 @@ SYNC_STATE = {
     "app_id": DEFAULT_APP_ID,
 }
 SYNC_LOCK = threading.Lock()
+
+# 利润订单同步状态（独立于库存同步）
+PROFIT_SYNC_STATE = {
+    "running": False,
+    "current_page": 0,
+    "total_pages": 0,
+    "processed_orders": 0,
+    "new_orders": 0,
+    "last_message": "",
+    "last_error": "",
+    "started_at": "",
+    "ended_at": "",
+    "app_id": DEFAULT_APP_ID,
+}
+PROFIT_SYNC_LOCK = threading.Lock()
+
+# 利润汇总缓存：按 app_id + 查询条件 + 时间窗口缓存 60 秒
+PROFIT_SUMMARY_CACHE = {}
+PROFIT_SUMMARY_CACHE_LOCK = threading.Lock()
 
 
 def get_sync_state():
@@ -221,6 +245,37 @@ def start_inventory_sync_background(app_id=DEFAULT_APP_ID):
     return True, "库存同步任务已启动"
 
 
+def get_profit_sync_state():
+    with PROFIT_SYNC_LOCK:
+        return dict(PROFIT_SYNC_STATE)
+
+
+def update_profit_sync_state(**kwargs):
+    with PROFIT_SYNC_LOCK:
+        for k, v in kwargs.items():
+            if k in PROFIT_SYNC_STATE:
+                PROFIT_SYNC_STATE[k] = v
+
+
+def reset_profit_sync_state(app_id=DEFAULT_APP_ID):
+    with PROFIT_SYNC_LOCK:
+        PROFIT_SYNC_STATE["running"] = False
+        PROFIT_SYNC_STATE["current_page"] = 0
+        PROFIT_SYNC_STATE["total_pages"] = 0
+        PROFIT_SYNC_STATE["processed_orders"] = 0
+        PROFIT_SYNC_STATE["new_orders"] = 0
+        PROFIT_SYNC_STATE["last_message"] = ""
+        PROFIT_SYNC_STATE["last_error"] = ""
+        PROFIT_SYNC_STATE["started_at"] = ""
+        PROFIT_SYNC_STATE["ended_at"] = ""
+        PROFIT_SYNC_STATE["app_id"] = app_id
+
+
+def clear_profit_summary_cache():
+    with PROFIT_SUMMARY_CACHE_LOCK:
+        PROFIT_SUMMARY_CACHE.clear()
+
+
 
 # =========================
 # 数据库
@@ -269,6 +324,17 @@ def init_db():
         exterior_name TEXT,
         updated_at TEXT,
         UNIQUE(steam_id, app_id, asset_id)
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS asset_ownership_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL,
+        steam_id TEXT NOT NULL,
+        first_seen_at TEXT,
+        last_seen_at TEXT,
+        UNIQUE(app_id, asset_id)
     )
     """)
 
@@ -320,6 +386,27 @@ def init_db():
         updated_at TEXT
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sync_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
+    )
+    """)
+
+    # 常用查询索引：利润分析页按 app_id / steam_id / 时间排序读取
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_seller_orders_app_steam_time
+    ON seller_orders (app_id, steam_id, order_create_time DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_seller_orders_app_time
+    ON seller_orders (app_id, order_create_time DESC)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_asset_ownership_app_asset
+    ON asset_ownership_history (app_id, asset_id)
+    """)
 
     conn.commit()
     conn.close()
@@ -342,6 +429,77 @@ def safe_float(v, default=0.0):
 
 def bool_to_int(v):
     return 1 if v else 0
+
+
+def ensure_image_cache_dir():
+    os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+
+
+def build_cached_image_filename(image_url):
+    url = (image_url or "").strip()
+    if not url:
+        return ""
+    parsed = urllib.parse.urlparse(url)
+    _, ext = os.path.splitext(parsed.path or "")
+    if ext.lower() not in [".png", ".jpg", ".jpeg", ".webp", ".gif"]:
+        ext = ".png"
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    return f"{digest}{ext}"
+
+
+def cache_image_and_get_local_url(image_url):
+    """
+    返回可直接给前端 img src 使用的 URL：
+    - 下载成功：/cached_image/<filename>
+    - 下载失败：原始远程 URL（兜底）
+    """
+    raw_url = (image_url or "").strip()
+    if not raw_url:
+        return ""
+
+    filename = build_cached_image_filename(raw_url)
+    if not filename:
+        return raw_url
+
+    ensure_image_cache_dir()
+    file_path = os.path.join(IMAGE_CACHE_DIR, filename)
+    if not os.path.exists(file_path):
+        try:
+            req = urllib.request.Request(raw_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            if data:
+                with open(file_path, "wb") as f:
+                    f.write(data)
+        except Exception:
+            return raw_url
+
+    return f"/cached_image/{filename}"
+
+
+def get_sync_meta(key, default_value=""):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM sync_meta WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return default_value
+    return str(row["value"] or default_value)
+
+
+def set_sync_meta(key, value):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO sync_meta (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+        value=excluded.value,
+        updated_at=excluded.updated_at
+    """, (key, str(value), now_str()))
+    conn.commit()
+    conn.close()
 
 
 def save_failed_sync_ids(failed_ids):
@@ -684,13 +842,14 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             continue
 
         current_asset_ids.add(asset_id)
+        upsert_asset_owner(cur, app_id=app_id, asset_id=asset_id, steam_id=steam_id, current_time=current_time)
 
         item_key = build_item_key(item)
         token = item.get("token", "") or ""
         style_token = item.get("styleToken", "") or ""
         name = item.get("name", "")
         short_name = item.get("shortName", "")
-        image_url = item.get("imageUrl", "")
+        image_url = cache_image_and_get_local_url(item.get("imageUrl", ""))
         price = safe_float(item.get("price", 0))
         status = int(item.get("status", 0) or 0)
         if_tradable = bool_to_int(item.get("ifTradable", False))
@@ -752,115 +911,215 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
     return None
 
 
-def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
-    accounts = get_all_accounts_from_db()
-    if not accounts:
-        return "没有账号，请先同步所有账号"
+def build_asset_owner_map(app_id=DEFAULT_APP_ID):
+    """
+    从库存表构建 asset_id -> steam_id 映射，用于利润订单里 steamId 缺失时回填账号。
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT asset_id, steam_id
+    FROM asset_ownership_history
+    WHERE app_id = ? AND asset_id IS NOT NULL AND asset_id != ''
+    ORDER BY last_seen_at DESC
+    """, (str(app_id),))
+    rows = cur.fetchall()
+    conn.close()
 
+    owner_map = {}
+    for r in rows:
+        asset_id = str(r["asset_id"] or "").strip()
+        steam_id = str(r["steam_id"] or "").strip()
+        if asset_id and steam_id and asset_id not in owner_map:
+            owner_map[asset_id] = steam_id
+    return owner_map
+
+
+def upsert_asset_owner(cur, app_id, asset_id, steam_id, current_time):
+    cur.execute("""
+    INSERT INTO asset_ownership_history (app_id, asset_id, steam_id, first_seen_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(app_id, asset_id) DO UPDATE SET
+        steam_id=excluded.steam_id,
+        last_seen_at=excluded.last_seen_at
+    """, (str(app_id), str(asset_id), str(steam_id), current_time, current_time))
+
+
+def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
     conn = get_conn()
     cur = conn.cursor()
     current_time = now_str()
+    page = 1
+    max_pages = 200
+    processed_orders = 0
+    new_orders = 0
+    asset_owner_map = build_asset_owner_map(app_id=app_id)
 
-    success_accounts = 0
-    failed = []
+    checkpoint_time_key = f"profit_sync_last_order_create_time:{app_id}:{status}"
+    checkpoint_id_key = f"profit_sync_last_order_id:{app_id}:{status}"
+    last_synced_time = int(get_sync_meta(checkpoint_time_key, "0") or 0)
+    last_synced_order_id = get_sync_meta(checkpoint_id_key, "")
+    max_seen_time = last_synced_time
+    max_seen_order_id = last_synced_order_id
 
-    for acc in accounts:
-        steam_id = str(acc["steam_id"]).strip()
-        if not steam_id:
-            continue
+    try:
+        stop_early = False
+        while page <= max_pages:
+            data, error = fetch_seller_order_list_from_api(
+                steam_id=None,  # 不按 SteamID 拆分，直接拉当前 API KEY 下的订单
+                app_id=app_id,
+                status=status,
+                page=page,
+                limit=100
+            )
+            if error:
+                conn.close()
+                return f"订单同步失败：{error}"
 
-        page = 1
-        max_pages = 50
+            order_list = data.get("list", []) or []
+            pages = int(data.get("pages", 0) or 0)
+            update_profit_sync_state(
+                current_page=page,
+                total_pages=pages,
+                processed_orders=processed_orders,
+                new_orders=new_orders,
+                last_message=f"正在同步利润订单，第 {page}/{pages or '?'} 页"
+            )
 
-        try:
-            while page <= max_pages:
-                data, error = fetch_seller_order_list_from_api(
-                    steam_id=steam_id,
-                    app_id=app_id,
-                    status=status,
-                    page=page,
-                    limit=100
+            for order in order_list:
+                asset_info = order.get("assetInfo", {}) or {}
+                item_info = order.get("itemInfo", {}) or {}
+
+                order_id = str(order.get("orderId", "") or "")
+                steam_id = str(order.get("steamId", "") or "")
+                product_id = str(order.get("productId", "") or "")
+                item_id = str(order.get("itemId", "") or "")
+                name = order.get("name", "")
+                market_hash_name = order.get("marketHashName", "")
+                image_url = cache_image_and_get_local_url(order.get("imageUrl", ""))
+                order_price = safe_float(order.get("price", 0))
+                order_status = int(order.get("status", 0) or 0)
+                status_name = order.get("statusName", "")
+                order_create_time = int(order.get("orderCreateTime", 0) or 0)
+                asset_id = str(asset_info.get("assetId", "") or "")
+                style_id = str(asset_info.get("styleId", "") or "")
+                wear = str(asset_info.get("wear", "") or "")
+                weapon_name = item_info.get("weaponName", "")
+                exterior_name = item_info.get("exteriorName", "")
+
+                if not order_id:
+                    continue
+                if not steam_id and asset_id:
+                    steam_id = asset_owner_map.get(asset_id, "")
+
+                # 增量同步：遇到上次同步边界数据后，提前终止后续翻页
+                if last_synced_time > 0:
+                    if order_create_time < last_synced_time:
+                        stop_early = True
+                        break
+                    if order_create_time == last_synced_time and order_id == last_synced_order_id:
+                        stop_early = True
+                        break
+
+                cur.execute("""
+                INSERT INTO seller_orders (
+                    order_id, steam_id, product_id, app_id, item_id, name, market_hash_name,
+                    image_url, order_price, order_status, status_name, order_create_time,
+                    asset_id, style_id, wear, weapon_name, exterior_name, updated_at
                 )
-                if error:
-                    failed.append(f"{steam_id}: {error}")
-                    break
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    steam_id=excluded.steam_id,
+                    product_id=excluded.product_id,
+                    app_id=excluded.app_id,
+                    item_id=excluded.item_id,
+                    name=excluded.name,
+                    market_hash_name=excluded.market_hash_name,
+                    image_url=excluded.image_url,
+                    order_price=excluded.order_price,
+                    order_status=excluded.order_status,
+                    status_name=excluded.status_name,
+                    order_create_time=excluded.order_create_time,
+                    asset_id=excluded.asset_id,
+                    style_id=excluded.style_id,
+                    wear=excluded.wear,
+                    weapon_name=excluded.weapon_name,
+                    exterior_name=excluded.exterior_name,
+                    updated_at=excluded.updated_at
+                """, (
+                    order_id, steam_id, product_id, str(app_id), item_id, name, market_hash_name,
+                    image_url, order_price, order_status, status_name, order_create_time,
+                    asset_id, style_id, wear, weapon_name, exterior_name, current_time
+                ))
+                processed_orders += 1
+                new_orders += 1
+                if order_create_time > max_seen_time:
+                    max_seen_time = order_create_time
+                    max_seen_order_id = order_id
 
-                order_list = data.get("list", []) or []
-                pages = int(data.get("pages", 0) or 0)
+            conn.commit()
 
-                for order in order_list:
-                    asset_info = order.get("assetInfo", {}) or {}
-                    item_info = order.get("itemInfo", {}) or {}
-
-                    order_id = str(order.get("orderId", "") or "")
-                    product_id = str(order.get("productId", "") or "")
-                    item_id = str(order.get("itemId", "") or "")
-                    name = order.get("name", "")
-                    market_hash_name = order.get("marketHashName", "")
-                    image_url = order.get("imageUrl", "")
-                    order_price = safe_float(order.get("price", 0))
-                    order_status = int(order.get("status", 0) or 0)
-                    status_name = order.get("statusName", "")
-                    order_create_time = int(order.get("orderCreateTime", 0) or 0)
-                    asset_id = str(asset_info.get("assetId", "") or "")
-                    style_id = str(asset_info.get("styleId", "") or "")
-                    wear = str(asset_info.get("wear", "") or "")
-                    weapon_name = item_info.get("weaponName", "")
-                    exterior_name = item_info.get("exteriorName", "")
-
-                    if not order_id:
-                        continue
-
-                    cur.execute("""
-                    INSERT INTO seller_orders (
-                        order_id, steam_id, product_id, app_id, item_id, name, market_hash_name,
-                        image_url, order_price, order_status, status_name, order_create_time,
-                        asset_id, style_id, wear, weapon_name, exterior_name, updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(order_id) DO UPDATE SET
-                        steam_id=excluded.steam_id,
-                        product_id=excluded.product_id,
-                        app_id=excluded.app_id,
-                        item_id=excluded.item_id,
-                        name=excluded.name,
-                        market_hash_name=excluded.market_hash_name,
-                        image_url=excluded.image_url,
-                        order_price=excluded.order_price,
-                        order_status=excluded.order_status,
-                        status_name=excluded.status_name,
-                        order_create_time=excluded.order_create_time,
-                        asset_id=excluded.asset_id,
-                        style_id=excluded.style_id,
-                        wear=excluded.wear,
-                        weapon_name=excluded.weapon_name,
-                        exterior_name=excluded.exterior_name,
-                        updated_at=excluded.updated_at
-                    """, (
-                        order_id, steam_id, product_id, str(app_id), item_id, name, market_hash_name,
-                        image_url, order_price, order_status, status_name, order_create_time,
-                        asset_id, style_id, wear, weapon_name, exterior_name, current_time
-                    ))
-
-                conn.commit()
-
-                if not order_list:
-                    break
-                if pages and page >= pages:
-                    break
-
-                page += 1
-
-            success_accounts += 1
-
-        except Exception as e:
-            failed.append(f"{steam_id}: {str(e)}")
+            if stop_early:
+                break
+            if not order_list:
+                break
+            if pages and page >= pages:
+                break
+            page += 1
+    except Exception as e:
+        conn.close()
+        return f"订单同步失败：{str(e)}"
 
     conn.close()
-
-    if failed:
-        return f"订单同步完成，成功账号 {success_accounts} 个，失败 {len(failed)} 个。失败示例：{' | '.join(failed[:5])}"
+    if max_seen_time > last_synced_time:
+        set_sync_meta(checkpoint_time_key, max_seen_time)
+        set_sync_meta(checkpoint_id_key, max_seen_order_id)
+    update_profit_sync_state(
+        processed_orders=processed_orders,
+        new_orders=new_orders
+    )
+    clear_profit_summary_cache()
     return None
+
+
+def reconcile_order_owners_by_asset(app_id=DEFAULT_APP_ID, status="10"):
+    """
+    对已存在但 steam_id 为空的订单，按 asset_id 从归属历史回填账号。
+    """
+    owner_map = build_asset_owner_map(app_id=app_id)
+    if not owner_map:
+        return 0
+
+    conn = get_conn()
+    cur = conn.cursor()
+    params = [str(app_id)]
+    sql = """
+    SELECT order_id, asset_id
+    FROM seller_orders
+    WHERE app_id = ?
+      AND (steam_id IS NULL OR steam_id = '')
+    """
+    if status != "":
+        sql += " AND order_status = ?"
+        params.append(int(status))
+
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    updated = 0
+    for r in rows:
+        order_id = str(r["order_id"] or "")
+        asset_id = str(r["asset_id"] or "")
+        steam_id = owner_map.get(asset_id, "")
+        if not order_id or not steam_id:
+            continue
+        cur.execute("UPDATE seller_orders SET steam_id = ? WHERE order_id = ?", (steam_id, order_id))
+        updated += 1
+
+    conn.commit()
+    conn.close()
+    if updated:
+        clear_profit_summary_cache()
+    return updated
 
 
 def get_inventory_from_db(steam_id, app_id=DEFAULT_APP_ID):
@@ -902,6 +1161,7 @@ def get_inventory_from_db(steam_id, app_id=DEFAULT_APP_ID):
     items = []
     for r in rows:
         d = dict(r)
+        d["image_url"] = cache_image_and_get_local_url(d.get("image_url", ""))
         d["status_text"] = translate_status(d["status"])
         d["purchase_price"] = safe_float(d.get("purchase_price", 0), 0)
         d["profit"] = safe_float(d.get("price", 0), 0) - d["purchase_price"]
@@ -1063,11 +1323,11 @@ def get_inventory_item_for_sale(item_key, steam_id=None, app_id=DEFAULT_APP_ID):
     return dict(row) if row else None
 
 
-def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id=""):
+def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page=1, page_size=100):
     conn = get_conn()
     cur = conn.cursor()
 
-    sql = """
+    base_sql = """
     SELECT
         o.order_id,
         o.steam_id,
@@ -1103,22 +1363,71 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id=""):
      AND o.name = g.group_name
     WHERE o.app_id = ?
     """
-
-
+    count_sql = """
+    SELECT COUNT(1) AS total
+    FROM seller_orders o
+    LEFT JOIN steam_accounts a
+      ON o.steam_id = a.steam_id
+    WHERE o.app_id = ?
+    """
     params = [str(app_id)]
+    where_clauses = []
 
     if steam_id:
-        sql += " AND o.steam_id = ?"
+        where_clauses.append("o.steam_id = ?")
         params.append(steam_id)
+    keyword = (keyword or "").strip().lower()
+    if keyword:
+        # 两级搜索：先走“精确字段”匹配，再走“模糊字段”匹配
+        exact_clauses = []
+        exact_params = []
+        if keyword.isdigit():
+            exact_clauses.extend([
+                "o.order_id = ?",
+                "o.product_id = ?",
+                "o.asset_id = ?",
+                "o.style_id = ?",
+                "o.steam_id = ?",
+            ])
+            exact_params.extend([keyword] * 5)
 
-    sql += " ORDER BY o.order_create_time DESC, o.order_id DESC"
+        fuzzy_sql = """
+            LOWER(COALESCE(o.name, '')) LIKE ?
+            OR LOWER(COALESCE(o.market_hash_name, '')) LIKE ?
+            OR LOWER(COALESCE(a.nickname, '')) LIKE ?
+            OR LOWER(COALESCE(a.username, '')) LIKE ?
+            OR LOWER(COALESCE(o.weapon_name, '')) LIKE ?
+            OR LOWER(COALESCE(o.exterior_name, '')) LIKE ?
+        """
+        fuzzy_kw = f"%{keyword}%"
+        fuzzy_params = [fuzzy_kw] * 6
 
-    cur.execute(sql, params)
+        if exact_clauses:
+            where_clauses.append(f"(({' OR '.join(exact_clauses)}) OR ({fuzzy_sql}))")
+            params.extend(exact_params + fuzzy_params)
+        else:
+            where_clauses.append(f"({fuzzy_sql})")
+            params.extend(fuzzy_params)
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = " AND " + " AND ".join(where_clauses)
+
+    safe_page = max(int(page or 1), 1)
+    safe_page_size = min(max(int(page_size or 100), 20), 200)
+    offset = (safe_page - 1) * safe_page_size
+
+    cur.execute(count_sql + where_sql, params)
+    count_row = cur.fetchone()
+    total_count = int(count_row["total"] if count_row else 0)
+
+    sql = base_sql + where_sql + " ORDER BY o.order_create_time DESC, o.order_id DESC LIMIT ? OFFSET ?"
+    query_params = list(params) + [safe_page_size, offset]
+    cur.execute(sql, query_params)
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
 
     result = []
-    keyword = (keyword or "").strip().lower()
 
     for row in rows:
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
@@ -1127,6 +1436,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id=""):
 
         order_price = safe_float(row.get("order_price", 0), 0)
         profit = order_price - cost_price
+        counted_in_profit = cost_price > 0
 
         record = {
             "order_id": str(row.get("order_id", "") or ""),
@@ -1135,7 +1445,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id=""):
             "app_id": str(row.get("app_id", "") or ""),
             "name": row.get("name", ""),
             "market_hash_name": row.get("market_hash_name", ""),
-            "image_url": row.get("image_url", ""),
+            "image_url": cache_image_and_get_local_url(row.get("image_url", "")),
             "order_price": order_price,
             "order_status": int(row.get("order_status", 0) or 0),
             "status_name": row.get("status_name", ""),
@@ -1150,37 +1460,123 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id=""):
             "username": row.get("username", ""),
             "cost_price": cost_price,
             "profit": profit,
+            "counted_in_profit": counted_in_profit,
         }
-
-        search_blob = " ".join(
-            str(x or "") for x in [
-                record.get("name"),
-                record.get("market_hash_name"),
-                record.get("asset_id"),
-                record.get("style_id"),
-                record.get("steam_id"),
-                record.get("nickname"),
-                record.get("username"),
-                record.get("weapon_name"),
-                record.get("exterior_name"),
-                record.get("order_id"),
-                record.get("product_id"),
-            ]
-        ).lower()
-
-        if keyword and keyword not in search_blob:
-            continue
 
         result.append(record)
 
-    return result
+    return result, total_count, safe_page, safe_page_size
+
+
+def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", days=14):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    sql = """
+    SELECT
+        o.order_create_time,
+        o.order_price,
+        COALESCE(p.purchase_price, 0) AS item_purchase_price,
+        COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        o.name,
+        o.market_hash_name,
+        o.asset_id,
+        o.style_id,
+        o.steam_id,
+        o.weapon_name,
+        o.exterior_name,
+        o.order_id,
+        o.product_id,
+        a.nickname,
+        a.username
+    FROM seller_orders o
+    LEFT JOIN steam_accounts a
+      ON o.steam_id = a.steam_id
+    LEFT JOIN item_purchase_prices p
+      ON o.steam_id = p.steam_id
+     AND o.app_id = p.app_id
+     AND o.asset_id = p.asset_id
+    LEFT JOIN group_purchase_prices g
+      ON o.steam_id = g.steam_id
+     AND o.app_id = g.app_id
+     AND o.name = g.group_name
+    WHERE o.app_id = ?
+    """
+    params = [str(app_id)]
+    where_clauses = []
+
+    if steam_id:
+        where_clauses.append("o.steam_id = ?")
+        params.append(steam_id)
+
+    keyword = (keyword or "").strip().lower()
+    if keyword:
+        exact_clauses = []
+        exact_params = []
+        if keyword.isdigit():
+            exact_clauses.extend([
+                "o.order_id = ?",
+                "o.product_id = ?",
+                "o.asset_id = ?",
+                "o.style_id = ?",
+                "o.steam_id = ?",
+            ])
+            exact_params.extend([keyword] * 5)
+
+        fuzzy_sql = """
+            LOWER(COALESCE(o.name, '')) LIKE ?
+            OR LOWER(COALESCE(o.market_hash_name, '')) LIKE ?
+            OR LOWER(COALESCE(a.nickname, '')) LIKE ?
+            OR LOWER(COALESCE(a.username, '')) LIKE ?
+            OR LOWER(COALESCE(o.weapon_name, '')) LIKE ?
+            OR LOWER(COALESCE(o.exterior_name, '')) LIKE ?
+        """
+        fuzzy_kw = f"%{keyword}%"
+        fuzzy_params = [fuzzy_kw] * 6
+        if exact_clauses:
+            where_clauses.append(f"(({' OR '.join(exact_clauses)}) OR ({fuzzy_sql}))")
+            params.extend(exact_params + fuzzy_params)
+        else:
+            where_clauses.append(f"({fuzzy_sql})")
+            params.extend(fuzzy_params)
+
+    if where_clauses:
+        sql += " AND " + " AND ".join(where_clauses)
+
+    sql += " ORDER BY o.order_create_time DESC"
+    cur.execute(sql, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    daily = defaultdict(float)
+    for row in rows:
+        item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        group_cost = safe_float(row.get("group_purchase_price", 0), 0)
+        cost_price = item_cost if item_cost > 0 else group_cost
+        if cost_price <= 0:
+            continue
+
+        order_price = safe_float(row.get("order_price", 0), 0)
+        profit = order_price - cost_price
+        ts = int(row.get("order_create_time", 0) or 0)
+        if ts <= 0:
+            continue
+        if ts > 10**12:
+            ts = ts / 1000.0
+        day_key = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        daily[day_key] += profit
+
+    ordered = sorted(daily.items(), key=lambda x: x[0])
+    ordered = ordered[-max(1, int(days)):]
+    return [{"day": d[5:], "profit": round(v, 2)} for d, v in ordered]
 
 
 def build_profit_summary(rows):
     total_orders = len(rows)
-    total_revenue = sum(safe_float(x["order_price"], 0) for x in rows)
-    total_cost = sum(safe_float(x["cost_price"], 0) for x in rows)
-    total_profit = sum(safe_float(x["profit"], 0) for x in rows)
+    counted_rows = [x for x in rows if x.get("counted_in_profit")]
+    total_revenue = sum(safe_float(x["order_price"], 0) for x in counted_rows)
+    total_cost = sum(safe_float(x["cost_price"], 0) for x in counted_rows)
+    total_profit = sum(safe_float(x["profit"], 0) for x in counted_rows)
 
     by_name = defaultdict(lambda: {
         "name": "",
@@ -1200,7 +1596,7 @@ def build_profit_summary(rows):
         "profit": 0.0,
     })
 
-    for row in rows:
+    for row in counted_rows:
         name_key = row["name"] or "未命名商品"
         by_name[name_key]["name"] = name_key
         by_name[name_key]["count"] += 1
@@ -1228,6 +1624,39 @@ def build_profit_summary(rows):
         "by_name_rows": by_name_rows,
         "by_account_rows": by_account_rows,
     }
+
+
+def get_profit_summary_cached(rows, app_id, steam_id, keyword, page, page_size):
+    # 按 app_id + 查询条件 + 60 秒时间窗口缓存，减少重复聚合计算
+    window_bucket = int(time.time() // 60)
+    cache_key = (str(app_id), str(steam_id or ""), str(keyword or ""), int(page), int(page_size), window_bucket)
+    with PROFIT_SUMMARY_CACHE_LOCK:
+        cached = PROFIT_SUMMARY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    summary = build_profit_summary(rows)
+    with PROFIT_SUMMARY_CACHE_LOCK:
+        PROFIT_SUMMARY_CACHE[cache_key] = summary
+    return summary
+
+
+def build_daily_profit_chart_data(rows, days=14):
+    daily = defaultdict(float)
+    for row in rows:
+        if not row.get("counted_in_profit"):
+            continue
+        ts = int(row.get("order_create_time", 0) or 0)
+        if ts <= 0:
+            continue
+        if ts > 10**12:
+            ts = ts / 1000.0
+        day = datetime.fromtimestamp(ts).strftime("%m-%d")
+        daily[day] += safe_float(row.get("profit", 0), 0)
+
+    ordered = sorted(daily.items(), key=lambda x: x[0])
+    ordered = ordered[-max(1, int(days)):]
+    return [{"day": d, "profit": round(v, 2)} for d, v in ordered]
 
 
 # =========================
@@ -1332,39 +1761,32 @@ ACCOUNTS_TEMPLATE = """
                     {% endif %}
                 </div>
             </div>
-
             <div class="sync-card">
                 <div class="sync-k">当前正在同步的 SteamID</div>
                 <div id="syncCurrentSteamId" class="sync-v">{{ sync_status.current_steam_id or '-' }}</div>
             </div>
-
             <div class="sync-card">
                 <div class="sync-k">已完成 / 总数</div>
                 <div id="syncProgressText" class="sync-v">{{ sync_status.finished }}/{{ sync_status.total }}</div>
             </div>
-
             <div class="sync-card">
                 <div class="sync-k">成功 / 库存为空 / 失败</div>
                 <div id="syncCounterText" class="sync-v">{{ sync_status.success_count }}/{{ sync_status.empty_count }}/{{ sync_status.failed_count }}</div>
             </div>
-
             <div class="sync-card">
                 <div class="sync-k">开始时间</div>
                 <div id="syncStartedAt" class="sync-v">{{ sync_status.started_at or '-' }}</div>
             </div>
-
             <div class="sync-card">
                 <div class="sync-k">结束时间</div>
                 <div id="syncEndedAt" class="sync-v">{{ sync_status.ended_at or '-' }}</div>
             </div>
         </div>
-
         <div class="progress-wrap">
             <div class="progress-bar">
                 <div id="syncProgressBar" class="progress-inner" style="width: {{ (sync_status.finished * 100 / sync_status.total) if sync_status.total else 0 }}%;"></div>
             </div>
         </div>
-
         <div id="syncLastError" class="sync-note">
             {% if sync_status.last_error %}
                 失败信息：{{ sync_status.last_error }}
@@ -1389,7 +1811,7 @@ ACCOUNTS_TEMPLATE = """
                  onclick="window.location='/inventory/{{ item.steam_id }}'">
                 <div class="row-top">
                     <img class="avatar" src="{{ item.avatar }}" alt="avatar"
-                         onerror="this.src='https://via.placeholder.com/76?text=No+Img'">
+                         onerror="this.onerror=null;this.src='https://via.placeholder.com/76?text=No+Img'">
                     <div class="name-wrap">
                         <div class="nickname">{{ item.nickname if item.nickname else '未设置昵称' }}</div>
                         <div class="username">{{ item.username if item.username else '无用户名' }}</div>
@@ -1866,7 +2288,7 @@ INVENTORY_TEMPLATE = """
                         <img class="summary-img"
                              src="{{ row.image_url or 'https://via.placeholder.com/80x64?text=No+Img' }}"
                              alt="summary image"
-                             onerror="this.src='https://via.placeholder.com/80x64?text=No+Img'">
+                             onerror="this.onerror=null;this.src='https://via.placeholder.com/80x64?text=No+Img'">
                     </div>
 
                     <div>
@@ -1953,7 +2375,7 @@ INVENTORY_TEMPLATE = """
                         <img class="detail-img"
                              src="{{ item.image_url or 'https://via.placeholder.com/90x72?text=No+Img' }}"
                              alt="item image"
-                             onerror="this.src='https://via.placeholder.com/90x72?text=No+Img'">
+                             onerror="this.onerror=null;this.src='https://via.placeholder.com/90x72?text=No+Img'">
                     </div>
 
                     <div>
@@ -2285,71 +2707,6 @@ ALL_INVENTORY_TEMPLATE = """
     {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
 
-    <div class="sync-panel">
-        <div class="sync-head">
-            <div class="sync-title">库存同步任务状态</div>
-            {% if sync_status.running %}
-                <div id="syncBadge" class="sync-badge {% if sync_status.cancel_requested %}sync-cancel{% else %}sync-running{% endif %}">
-                    {{ '取消中' if sync_status.cancel_requested else '运行中' }}
-                </div>
-            {% else %}
-                <div id="syncBadge" class="sync-badge sync-idle">空闲</div>
-            {% endif %}
-        </div>
-
-        <div class="sync-grid">
-            <div class="sync-card">
-                <div class="sync-k">当前同步状态</div>
-                <div id="syncStateText" class="sync-v">
-                    {% if sync_status.running %}
-                        {{ '已请求取消，等待当前账号结束' if sync_status.cancel_requested else '正在同步库存' }}
-                    {% else %}
-                        {{ sync_status.last_message or '当前没有运行中的同步任务' }}
-                    {% endif %}
-                </div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">当前正在同步的 SteamID</div>
-                <div id="syncCurrentSteamId" class="sync-v">{{ sync_status.current_steam_id or '-' }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">已完成 / 总数</div>
-                <div id="syncProgressText" class="sync-v">{{ sync_status.finished }}/{{ sync_status.total }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">成功 / 库存为空 / 失败</div>
-                <div id="syncCounterText" class="sync-v">{{ sync_status.success_count }}/{{ sync_status.empty_count }}/{{ sync_status.failed_count }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">开始时间</div>
-                <div id="syncStartedAt" class="sync-v">{{ sync_status.started_at or '-' }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">结束时间</div>
-                <div id="syncEndedAt" class="sync-v">{{ sync_status.ended_at or '-' }}</div>
-            </div>
-        </div>
-
-        <div class="progress-wrap">
-            <div class="progress-bar">
-                <div id="syncProgressBar" class="progress-inner" style="width: {{ (sync_status.finished * 100 / sync_status.total) if sync_status.total else 0 }}%;"></div>
-            </div>
-        </div>
-
-        <div id="syncLastError" class="sync-note">
-            {% if sync_status.last_error %}
-                失败信息：{{ sync_status.last_error }}
-            {% else %}
-                暂无失败信息
-            {% endif %}
-        </div>
-    </div>
-
     <div class="toggle-bar" style="margin: 16px 0 20px 0;">
         <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'all' else '' }}">全部</a>
@@ -2405,7 +2762,7 @@ ALL_INVENTORY_TEMPLATE = """
             <div class="row">
                 <div>
                     <img class="img" src="{{ item.image_url or 'https://via.placeholder.com/80x64?text=No+Img' }}" alt="item"
-                         onerror="this.src='https://via.placeholder.com/80x64?text=No+Img'">
+                         onerror="this.onerror=null;this.src='https://via.placeholder.com/80x64?text=No+Img'">
                 </div>
 
                 <div>
@@ -2591,6 +2948,21 @@ PROFIT_ANALYSIS_TEMPLATE = """
             border: 1px solid #25344c;
             border-radius: 18px;
         }
+        .pager {
+            margin-top: 14px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .pager-info { color: #8ca3c7; font-size: 13px; }
+        .chart-wrap { margin: 8px 0 24px 0; background:#121c2f; border:1px solid #25344c; border-radius:16px; padding:14px; }
+        .chart-bars { display:flex; align-items:flex-end; gap:8px; min-height:180px; }
+        .bar-col { flex:1; min-width:30px; text-align:center; }
+        .bar { width:100%; border-radius:8px 8px 0 0; background:#2563eb; }
+        .bar.neg { background:#b91c1c; }
+        .bar-label { margin-top:6px; color:#8ca3c7; font-size:11px; }
+        .bar-value { color:#e5eefc; font-size:11px; margin-top:4px; }
 
         @media (max-width: 1280px) {
             .order-head, .order-row,
@@ -2631,67 +3003,14 @@ PROFIT_ANALYSIS_TEMPLATE = """
     {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
 
-    <div class="sync-panel">
-        <div class="sync-head">
-            <div class="sync-title">库存同步任务状态</div>
-            {% if sync_status.running %}
-                <div id="syncBadge" class="sync-badge {% if sync_status.cancel_requested %}sync-cancel{% else %}sync-running{% endif %}">
-                    {{ '取消中' if sync_status.cancel_requested else '运行中' }}
-                </div>
+    <div class="stat" style="margin-bottom:18px;">
+        <div class="stat-label">利润订单同步任务状态</div>
+        <div id="profitSyncState" class="sub">
+            {% if profit_sync_status.running %}
+                运行中：第 {{ profit_sync_status.current_page }}/{{ profit_sync_status.total_pages or '?' }} 页，
+                已处理 {{ profit_sync_status.processed_orders }} 条，新增 {{ profit_sync_status.new_orders }} 条
             {% else %}
-                <div id="syncBadge" class="sync-badge sync-idle">空闲</div>
-            {% endif %}
-        </div>
-
-        <div class="sync-grid">
-            <div class="sync-card">
-                <div class="sync-k">当前同步状态</div>
-                <div id="syncStateText" class="sync-v">
-                    {% if sync_status.running %}
-                        {{ '已请求取消，等待当前账号结束' if sync_status.cancel_requested else '正在同步库存' }}
-                    {% else %}
-                        {{ sync_status.last_message or '当前没有运行中的同步任务' }}
-                    {% endif %}
-                </div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">当前正在同步的 SteamID</div>
-                <div id="syncCurrentSteamId" class="sync-v">{{ sync_status.current_steam_id or '-' }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">已完成 / 总数</div>
-                <div id="syncProgressText" class="sync-v">{{ sync_status.finished }}/{{ sync_status.total }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">成功 / 库存为空 / 失败</div>
-                <div id="syncCounterText" class="sync-v">{{ sync_status.success_count }}/{{ sync_status.empty_count }}/{{ sync_status.failed_count }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">开始时间</div>
-                <div id="syncStartedAt" class="sync-v">{{ sync_status.started_at or '-' }}</div>
-            </div>
-
-            <div class="sync-card">
-                <div class="sync-k">结束时间</div>
-                <div id="syncEndedAt" class="sync-v">{{ sync_status.ended_at or '-' }}</div>
-            </div>
-        </div>
-
-        <div class="progress-wrap">
-            <div class="progress-bar">
-                <div id="syncProgressBar" class="progress-inner" style="width: {{ (sync_status.finished * 100 / sync_status.total) if sync_status.total else 0 }}%;"></div>
-            </div>
-        </div>
-
-        <div id="syncLastError" class="sync-note">
-            {% if sync_status.last_error %}
-                失败信息：{{ sync_status.last_error }}
-            {% else %}
-                暂无失败信息
+                {{ profit_sync_status.last_message or '当前没有运行中的利润订单同步任务' }}
             {% endif %}
         </div>
     </div>
@@ -2716,7 +3035,15 @@ PROFIT_ANALYSIS_TEMPLATE = """
     </div>
 
     <div class="section">
-        <div class="section-title">单笔订单利润</div>
+        <div class="section-title">近 14 天利润趋势（仅统计已设置成本价）</div>
+        <div class="chart-wrap">
+            <div id="dailyProfitBars" class="chart-bars"></div>
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">单笔订单利润（分页）</div>
+        <div class="sub">当前显示第 {{ page }} / {{ total_pages }} 页（每页 {{ page_size }} 条，共 {{ total_count }} 条）</div>
         {% if profit_rows %}
             <div class="head order-head">
                 <div>图片</div>
@@ -2734,7 +3061,8 @@ PROFIT_ANALYSIS_TEMPLATE = """
                 <div class="row order-row">
                     <div>
                         <img class="img" src="{{ row.image_url or 'https://via.placeholder.com/80x64?text=No+Img' }}" alt="item"
-                             onerror="this.src='https://via.placeholder.com/80x64?text=No+Img'">
+                             loading="lazy" decoding="async"
+                             onerror="this.onerror=null;this.src='https://via.placeholder.com/80x64?text=No+Img'">
                     </div>
 
                     <div>
@@ -2772,6 +3100,9 @@ PROFIT_ANALYSIS_TEMPLATE = """
                     <div class="{{ 'profit-plus' if row.profit >= 0 else 'profit-minus' }}">
                         ¥ {{ "%.2f"|format(row.profit) }}
                     </div>
+                    {% if not row.counted_in_profit %}
+                    <div class="subtext">未计入总利润（成本价未设置）</div>
+                    {% endif %}
 
                     <div>
                         <div class="num">{{ row.order_create_time_str }}</div>
@@ -2779,6 +3110,16 @@ PROFIT_ANALYSIS_TEMPLATE = """
                     </div>
                 </div>
                 {% endfor %}
+            </div>
+
+            <div class="pager">
+                {% if page > 1 %}
+                    <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page - 1 }}">上一页</a>
+                {% endif %}
+                {% if page < total_pages %}
+                    <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page + 1 }}">下一页</a>
+                {% endif %}
+                <div class="pager-info">提示：分页能显著减少首屏卡顿，筛选后默认从第 1 页开始。</div>
             </div>
         {% else %}
             <div class="empty">暂无利润订单数据，先点“同步利润订单”</div>
@@ -2847,6 +3188,47 @@ PROFIT_ANALYSIS_TEMPLATE = """
         {% endif %}
     </div>
 </div>
+<script>
+async function refreshProfitSyncStatus() {
+    try {
+        const resp = await fetch('/sync/profit_status', { cache: 'no-store' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const node = document.getElementById('profitSyncState');
+        if (!node) return;
+        if (data.running) {
+            node.textContent = `运行中：第 ${data.current_page || 0}/${data.total_pages || '?'} 页，已处理 ${data.processed_orders || 0} 条，新增 ${data.new_orders || 0} 条`;
+        } else {
+            node.textContent = data.last_message || '当前没有运行中的利润订单同步任务';
+        }
+    } catch (e) {
+        console.log('refreshProfitSyncStatus failed', e);
+    }
+}
+function renderDailyProfitBars() {
+    const container = document.getElementById('dailyProfitBars');
+    if (!container) return;
+    const data = {{ daily_profit_chart_json|safe }};
+    if (!Array.isArray(data) || data.length === 0) {
+        container.innerHTML = '<div class="subtext">暂无可视化数据（可能因成本价未设置）</div>';
+        return;
+    }
+    const maxAbs = Math.max(...data.map(x => Math.abs(Number(x.profit || 0))), 1);
+    container.innerHTML = data.map(x => {
+        const v = Number(x.profit || 0);
+        const h = Math.max(6, Math.round((Math.abs(v) / maxAbs) * 150));
+        const cls = v >= 0 ? 'bar' : 'bar neg';
+        return `<div class="bar-col">
+            <div class="${cls}" style="height:${h}px"></div>
+            <div class="bar-value">${v.toFixed(2)}</div>
+            <div class="bar-label">${x.day}</div>
+        </div>`;
+    }).join('');
+}
+renderDailyProfitBars();
+refreshProfitSyncStatus();
+setInterval(refreshProfitSyncStatus, 2000);
+</script>
 </body>
 </html>
 """
@@ -2869,6 +3251,16 @@ def accounts_page():
         steam_accounts=steam_accounts,
         sync_status=sync_status
     )
+
+
+@app.route("/cached_image/<path:filename>")
+def cached_image(filename):
+    safe_name = os.path.basename(filename or "")
+    if not safe_name:
+        abort(404)
+    if not os.path.exists(os.path.join(IMAGE_CACHE_DIR, safe_name)):
+        abort(404)
+    return send_from_directory(IMAGE_CACHE_DIR, safe_name)
 
 
 @app.route("/sync/accounts")
@@ -2953,41 +3345,109 @@ def sync_failed_inventory():
 @app.route("/sync/profit_orders")
 def sync_profit_orders():
     app_id = request.args.get("appId", DEFAULT_APP_ID)
-    error = sync_accounts_to_db()
-    if error:
-        return redirect(url_for("accounts_page", error=f"同步账号失败：{error}"))
+    state = get_profit_sync_state()
+    if state.get("running"):
+        return redirect(url_for("profit_analysis_page", error="利润订单同步任务正在运行，请稍后刷新查看进度"))
 
-    # 只同步已完成订单
-    sync_error = sync_seller_orders_to_db(app_id=app_id, status="10")
-    if sync_error:
-        return redirect(url_for("profit_analysis_page", error=sync_error))
+    reset_profit_sync_state(app_id=app_id)
+    update_profit_sync_state(
+        running=True,
+        started_at=now_str(),
+        app_id=app_id,
+        last_message="利润订单同步任务已启动",
+        last_error="",
+    )
 
-    return redirect(url_for("profit_analysis_page", msg="利润订单同步成功"))
+    def _worker():
+        try:
+            err = sync_accounts_to_db()
+            if err:
+                update_profit_sync_state(
+                    running=False,
+                    last_error=f"同步账号失败：{err}",
+                    last_message="利润订单同步任务启动失败",
+                    ended_at=now_str(),
+                )
+                return
+
+            sync_error = sync_seller_orders_to_db(app_id=app_id, status="10")
+            if sync_error:
+                update_profit_sync_state(
+                    running=False,
+                    last_error=sync_error,
+                    last_message="利润订单同步失败",
+                    ended_at=now_str(),
+                )
+                return
+
+            updated_count = reconcile_order_owners_by_asset(app_id=app_id, status="10")
+
+            update_profit_sync_state(
+                running=False,
+                last_message=f"利润订单同步完成，按 assetId 回填账号 {updated_count} 条",
+                last_error="",
+                ended_at=now_str(),
+            )
+        except Exception as e:
+            update_profit_sync_state(
+                running=False,
+                last_error=str(e),
+                last_message="利润订单同步异常退出",
+                ended_at=now_str(),
+            )
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return redirect(url_for("profit_analysis_page", msg="利润订单同步任务已启动，可在本页查看进度"))
+
+
+@app.route("/sync/profit_status")
+def sync_profit_status_api():
+    return jsonify(get_profit_sync_state())
 
 
 @app.route("/profit_analysis")
 def profit_analysis_page():
-    sync_status = get_sync_state()
+    profit_sync_status = get_profit_sync_state()
     app_id = request.args.get("appId", DEFAULT_APP_ID)
     keyword = request.args.get("q", "").strip()
     selected_steam_id = request.args.get("steam_id", "").strip()
+    page = request.args.get("page", "1")
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
 
     accounts = get_all_accounts_from_db()
-    profit_rows = get_profit_rows_from_db(app_id=app_id, keyword=keyword, steam_id=selected_steam_id)
-    summary = build_profit_summary(profit_rows)
+    profit_rows, total_count, page, page_size = get_profit_rows_from_db(
+        app_id=app_id,
+        keyword=keyword,
+        steam_id=selected_steam_id,
+        page=page,
+        page_size=100
+    )
+    summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
+    daily_profit_chart = get_daily_profit_chart_data_from_db(
+        app_id=app_id,
+        keyword=keyword,
+        steam_id=selected_steam_id,
+        days=14
+    )
+    total_pages = max((total_count + page_size - 1) // page_size, 1)
 
     return render_template_string(
         PROFIT_ANALYSIS_TEMPLATE,
         accounts=accounts,
         profit_rows=profit_rows,
         summary=summary,
+        app_id=app_id,
         keyword=keyword,
         selected_steam_id=selected_steam_id,
+        page=page,
+        page_size=page_size,
+        total_count=total_count,
+        total_pages=total_pages,
+        daily_profit_chart_json=json.dumps(daily_profit_chart, ensure_ascii=False),
         msg=msg,
         error=error,
-        sync_status = sync_status
+        profit_sync_status=profit_sync_status
     )
 
 
@@ -3265,6 +3725,7 @@ def all_inventory_page():
 
     items = []
     for row in rows:
+        row["image_url"] = cache_image_and_get_local_url(row.get("image_url", ""))
         row["purchase_price"] = safe_float(row.get("purchase_price", 0), 0)
         row["profit"] = safe_float(row.get("price", 0), 0) - row["purchase_price"]
         row["status_text"] = translate_status(row["status"])
