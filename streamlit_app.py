@@ -316,6 +316,7 @@ def init_db():
         short_name TEXT,
         image_url TEXT,
         price REAL DEFAULT 0,
+        cost_price REAL DEFAULT 0,
         status INTEGER,
         if_tradable INTEGER DEFAULT 0,
         wear TEXT,
@@ -326,6 +327,11 @@ def init_db():
         UNIQUE(steam_id, app_id, asset_id)
     )
     """)
+    # 兼容旧库：为 inventory_items 增加 cost_price 字段
+    cur.execute("PRAGMA table_info(inventory_items)")
+    inventory_cols = [str(r["name"]) for r in cur.fetchall()]
+    if "cost_price" not in inventory_cols:
+        cur.execute("ALTER TABLE inventory_items ADD COLUMN cost_price REAL DEFAULT 0")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS asset_ownership_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -851,6 +857,13 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
         short_name = item.get("shortName", "")
         image_url = cache_image_and_get_local_url(item.get("imageUrl", ""))
         price = safe_float(item.get("price", 0))
+        cost_price = safe_float(
+            item.get("purchasePrice",
+                     item.get("costPrice",
+                              item.get("cost",
+                                       item.get("buyPrice", 0)))),
+            0
+        )
         status = int(item.get("status", 0) or 0)
         if_tradable = bool_to_int(item.get("ifTradable", False))
         wear = asset_info.get("wear", "")
@@ -861,10 +874,10 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
         cur.execute("""
         INSERT INTO inventory_items (
             steam_id, app_id, item_key, asset_id, token, style_token,
-            name, short_name, image_url, price,
+            name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
             item_key=excluded.item_key,
             token=excluded.token,
@@ -873,6 +886,10 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             short_name=excluded.short_name,
             image_url=excluded.image_url,
             price=excluded.price,
+            cost_price=CASE
+                WHEN excluded.cost_price > 0 THEN excluded.cost_price
+                ELSE inventory_items.cost_price
+            END,
             status=excluded.status,
             if_tradable=excluded.if_tradable,
             wear=excluded.wear,
@@ -882,7 +899,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             updated_at=excluded.updated_at
         """, (
             steam_id, app_id, item_key, asset_id, token, style_token,
-            name, short_name, image_url, price,
+            name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, current_time
         ))
 
@@ -1138,6 +1155,7 @@ def get_inventory_from_db(steam_id, app_id=DEFAULT_APP_ID):
         i.short_name,
         i.image_url,
         i.price,
+        i.cost_price,
         i.status,
         i.if_tradable,
         i.wear,
@@ -1145,7 +1163,7 @@ def get_inventory_from_db(steam_id, app_id=DEFAULT_APP_ID):
         i.weapon_name,
         i.exterior_name,
         i.updated_at,
-        COALESCE(p.purchase_price, 0) AS purchase_price
+        COALESCE(p.purchase_price, i.cost_price, 0) AS purchase_price
     FROM inventory_items i
     LEFT JOIN item_purchase_prices p
       ON i.steam_id = p.steam_id
@@ -1203,13 +1221,20 @@ def save_group_default_purchase_price(steam_id, app_id, group_name, price):
 def save_item_purchase_price(steam_id, app_id, asset_id, purchase_price):
     conn = get_conn()
     cur = conn.cursor()
+    normalized_price = safe_float(purchase_price, 0)
+    current_time = now_str()
     cur.execute("""
     INSERT INTO item_purchase_prices (steam_id, app_id, asset_id, purchase_price, updated_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
         purchase_price=excluded.purchase_price,
         updated_at=excluded.updated_at
-    """, (steam_id, app_id, asset_id, safe_float(purchase_price, 0), now_str()))
+    """, (steam_id, app_id, asset_id, normalized_price, current_time))
+    cur.execute("""
+    UPDATE inventory_items
+    SET cost_price = ?, updated_at = ?
+    WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+    """, (normalized_price, current_time, steam_id, app_id, asset_id))
     conn.commit()
     conn.close()
 
@@ -1239,6 +1264,12 @@ def apply_group_price_to_items(steam_id, app_id, group_name, price):
             purchase_price=excluded.purchase_price,
             updated_at=excluded.updated_at
         """, (steam_id, app_id, asset_id, normalized_price, current_time))
+
+    cur.execute("""
+    UPDATE inventory_items
+    SET cost_price = ?, updated_at = ?
+    WHERE steam_id = ? AND app_id = ? AND name = ?
+    """, (normalized_price, current_time, steam_id, app_id, group_name))
 
     conn.commit()
     conn.close()
@@ -1346,19 +1377,24 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         o.wear,
         o.weapon_name,
         o.exterior_name,
+        COALESCE(o.steam_id, iv.steam_id) AS resolved_steam_id,
         a.nickname,
         a.username,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
-        COALESCE(g.default_purchase_price, 0) AS group_purchase_price
+        COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(iv.cost_price, 0) AS inventory_cost_price
     FROM seller_orders o
+    LEFT JOIN inventory_items iv
+      ON o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON o.steam_id = a.steam_id
+      ON COALESCE(o.steam_id, iv.steam_id) = a.steam_id
     LEFT JOIN item_purchase_prices p
-      ON o.steam_id = p.steam_id
-     AND o.app_id = p.app_id
-     AND o.asset_id = p.asset_id
+      ON COALESCE(o.steam_id, iv.steam_id) = p.steam_id
+      AND o.app_id = p.app_id
+      AND o.asset_id = p.asset_id
     LEFT JOIN group_purchase_prices g
-      ON o.steam_id = g.steam_id
+      ON COALESCE(o.steam_id, iv.steam_id) = g.steam_id
      AND o.app_id = g.app_id
      AND o.name = g.group_name
     WHERE o.app_id = ?
@@ -1366,15 +1402,18 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     count_sql = """
     SELECT COUNT(1) AS total
     FROM seller_orders o
+    LEFT JOIN inventory_items iv
+      ON o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON o.steam_id = a.steam_id
+      ON COALESCE(o.steam_id, iv.steam_id) = a.steam_id
     WHERE o.app_id = ?
     """
     params = [str(app_id)]
     where_clauses = []
 
     if steam_id:
-        where_clauses.append("o.steam_id = ?")
+        where_clauses.append("COALESCE(o.steam_id, iv.steam_id) = ?")
         params.append(steam_id)
     keyword = (keyword or "").strip().lower()
     if keyword:
@@ -1387,7 +1426,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
                 "o.product_id = ?",
                 "o.asset_id = ?",
                 "o.style_id = ?",
-                "o.steam_id = ?",
+                "COALESCE(o.steam_id, iv.steam_id) = ?",
             ])
             exact_params.extend([keyword] * 5)
 
@@ -1432,7 +1471,8 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     for row in rows:
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
-        cost_price = item_cost if item_cost > 0 else group_cost
+        inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
 
         order_price = safe_float(row.get("order_price", 0), 0)
         profit = order_price - cost_price
@@ -1440,7 +1480,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
 
         record = {
             "order_id": str(row.get("order_id", "") or ""),
-            "steam_id": str(row.get("steam_id", "") or ""),
+            "steam_id": str(row.get("resolved_steam_id", "") or ""),
             "product_id": str(row.get("product_id", "") or ""),
             "app_id": str(row.get("app_id", "") or ""),
             "name": row.get("name", ""),
@@ -1478,11 +1518,12 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         o.order_price,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
         COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(iv.cost_price, 0) AS inventory_cost_price,
         o.name,
         o.market_hash_name,
         o.asset_id,
         o.style_id,
-        o.steam_id,
+        COALESCE(o.steam_id, iv.steam_id) AS resolved_steam_id,
         o.weapon_name,
         o.exterior_name,
         o.order_id,
@@ -1490,14 +1531,17 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         a.nickname,
         a.username
     FROM seller_orders o
+    LEFT JOIN inventory_items iv
+      ON o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON o.steam_id = a.steam_id
+      ON COALESCE(o.steam_id, iv.steam_id) = a.steam_id
     LEFT JOIN item_purchase_prices p
-      ON o.steam_id = p.steam_id
+      ON COALESCE(o.steam_id, iv.steam_id) = p.steam_id
      AND o.app_id = p.app_id
      AND o.asset_id = p.asset_id
     LEFT JOIN group_purchase_prices g
-      ON o.steam_id = g.steam_id
+      ON COALESCE(o.steam_id, iv.steam_id) = g.steam_id
      AND o.app_id = g.app_id
      AND o.name = g.group_name
     WHERE o.app_id = ?
@@ -1506,7 +1550,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     where_clauses = []
 
     if steam_id:
-        where_clauses.append("o.steam_id = ?")
+        where_clauses.append("COALESCE(o.steam_id, iv.steam_id) = ?")
         params.append(steam_id)
 
     keyword = (keyword or "").strip().lower()
@@ -1519,7 +1563,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
                 "o.product_id = ?",
                 "o.asset_id = ?",
                 "o.style_id = ?",
-                "o.steam_id = ?",
+                "COALESCE(o.steam_id, iv.steam_id) = ?",
             ])
             exact_params.extend([keyword] * 5)
 
@@ -1552,7 +1596,8 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     for row in rows:
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
-        cost_price = item_cost if item_cost > 0 else group_cost
+        inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
         if cost_price <= 0:
             continue
 
@@ -3705,7 +3750,7 @@ def all_inventory_page():
         i.style_id,
         i.weapon_name,
         i.exterior_name,
-        COALESCE(p.purchase_price, 0) AS purchase_price,
+        COALESCE(p.purchase_price, i.cost_price, 0) AS purchase_price,
         a.nickname,
         a.username
     FROM inventory_items i
