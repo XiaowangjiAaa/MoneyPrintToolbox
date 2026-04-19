@@ -902,6 +902,17 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, current_time
         ))
+        if cost_price > 0:
+            cur.execute("""
+            INSERT INTO item_purchase_prices (steam_id, app_id, asset_id, purchase_price, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
+                purchase_price=CASE
+                    WHEN excluded.purchase_price > 0 THEN excluded.purchase_price
+                    ELSE item_purchase_prices.purchase_price
+                END,
+                updated_at=excluded.updated_at
+            """, (steam_id, app_id, asset_id, cost_price, current_time))
 
     # 删除本次同步中已经不存在的旧库存记录
     cur.execute("""
@@ -1377,24 +1388,28 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         o.wear,
         o.weapon_name,
         o.exterior_name,
-        COALESCE(o.steam_id, iv.steam_id) AS resolved_steam_id,
+        COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
         a.nickname,
         a.username,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
         COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
         COALESCE(iv.cost_price, 0) AS inventory_cost_price
     FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
     LEFT JOIN inventory_items iv
-      ON o.app_id = iv.app_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
      AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON COALESCE(o.steam_id, iv.steam_id) = a.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
     LEFT JOIN item_purchase_prices p
-      ON COALESCE(o.steam_id, iv.steam_id) = p.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = p.steam_id
       AND o.app_id = p.app_id
       AND o.asset_id = p.asset_id
     LEFT JOIN group_purchase_prices g
-      ON COALESCE(o.steam_id, iv.steam_id) = g.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = g.steam_id
      AND o.app_id = g.app_id
      AND o.name = g.group_name
     WHERE o.app_id = ?
@@ -1402,18 +1417,22 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     count_sql = """
     SELECT COUNT(1) AS total
     FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
     LEFT JOIN inventory_items iv
-      ON o.app_id = iv.app_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
      AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON COALESCE(o.steam_id, iv.steam_id) = a.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
     WHERE o.app_id = ?
     """
     params = [str(app_id)]
     where_clauses = []
 
     if steam_id:
-        where_clauses.append("COALESCE(o.steam_id, iv.steam_id) = ?")
+        where_clauses.append("COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?")
         params.append(steam_id)
     keyword = (keyword or "").strip().lower()
     if keyword:
@@ -1426,7 +1445,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
                 "o.product_id = ?",
                 "o.asset_id = ?",
                 "o.style_id = ?",
-                "COALESCE(o.steam_id, iv.steam_id) = ?",
+                "COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?",
             ])
             exact_params.extend([keyword] * 5)
 
@@ -1523,7 +1542,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         o.market_hash_name,
         o.asset_id,
         o.style_id,
-        COALESCE(o.steam_id, iv.steam_id) AS resolved_steam_id,
+        COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
         o.weapon_name,
         o.exterior_name,
         o.order_id,
@@ -1531,17 +1550,21 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         a.nickname,
         a.username
     FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
     LEFT JOIN inventory_items iv
-      ON o.app_id = iv.app_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
      AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON COALESCE(o.steam_id, iv.steam_id) = a.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
     LEFT JOIN item_purchase_prices p
-      ON COALESCE(o.steam_id, iv.steam_id) = p.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = p.steam_id
      AND o.app_id = p.app_id
      AND o.asset_id = p.asset_id
     LEFT JOIN group_purchase_prices g
-      ON COALESCE(o.steam_id, iv.steam_id) = g.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = g.steam_id
      AND o.app_id = g.app_id
      AND o.name = g.group_name
     WHERE o.app_id = ?
@@ -1550,7 +1573,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     where_clauses = []
 
     if steam_id:
-        where_clauses.append("COALESCE(o.steam_id, iv.steam_id) = ?")
+        where_clauses.append("COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?")
         params.append(steam_id)
 
     keyword = (keyword or "").strip().lower()
@@ -1563,7 +1586,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
                 "o.product_id = ?",
                 "o.asset_id = ?",
                 "o.style_id = ?",
-                "COALESCE(o.steam_id, iv.steam_id) = ?",
+                "COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?",
             ])
             exact_params.extend([keyword] * 5)
 
