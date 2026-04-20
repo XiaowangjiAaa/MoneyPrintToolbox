@@ -449,6 +449,18 @@ def init_db():
         updated_at TEXT
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS inventory_sync_status (
+        steam_id TEXT NOT NULL,
+        app_id TEXT NOT NULL,
+        last_sync_at TEXT,
+        last_status TEXT,
+        last_message TEXT,
+        last_error TEXT,
+        updated_at TEXT,
+        PRIMARY KEY (steam_id, app_id)
+    )
+    """)
 
     # 常用查询索引：利润分析页按 app_id / steam_id / 时间排序读取
     cur.execute("""
@@ -830,6 +842,72 @@ def load_inventory_sync_summary():
         return {}
 
 
+def save_account_inventory_sync_status(steam_id, app_id, status, message="", error=""):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    if not steam_id or not app_id:
+        return
+
+    current_time = now_str()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO inventory_sync_status (
+        steam_id, app_id, last_sync_at, last_status, last_message, last_error, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(steam_id, app_id) DO UPDATE SET
+        last_sync_at=excluded.last_sync_at,
+        last_status=excluded.last_status,
+        last_message=excluded.last_message,
+        last_error=excluded.last_error,
+        updated_at=excluded.updated_at
+    """, (
+        steam_id, app_id, current_time,
+        str(status or "").strip(),
+        str(message or "").strip(),
+        str(error or "").strip(),
+        current_time
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_account_inventory_sync_status(steam_id, app_id):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    if not steam_id or not app_id:
+        return {
+            "steam_id": steam_id,
+            "app_id": app_id,
+            "last_sync_at": "",
+            "last_status": "",
+            "last_message": "",
+            "last_error": "",
+            "updated_at": "",
+        }
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT steam_id, app_id, last_sync_at, last_status, last_message, last_error, updated_at
+    FROM inventory_sync_status
+    WHERE steam_id = ? AND app_id = ?
+    """, (steam_id, app_id))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {
+            "steam_id": steam_id,
+            "app_id": app_id,
+            "last_sync_at": "",
+            "last_status": "",
+            "last_message": "",
+            "last_error": "",
+            "updated_at": "",
+        }
+    return dict(row)
+
+
 def translate_status(status):
     mapping = {
         0: "正常",
@@ -1119,6 +1197,9 @@ def get_all_accounts_from_db():
 
 
 def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip() or DEFAULT_APP_ID
+
     raw_items, error = fetch_inventory_from_api(steam_id, app_id=app_id, language="zh")
     if error:
         # 库存为空，不算失败
@@ -1135,8 +1216,20 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             conn.commit()
             conn.close()
             save_inventory_snapshot(steam_id, app_id, {})
+            save_account_inventory_sync_status(
+                steam_id, app_id,
+                status="empty",
+                message="同步成功：库存为空",
+                error=""
+            )
 
             return "empty"   # 特殊状态：库存为空，但同步成功
+        save_account_inventory_sync_status(
+            steam_id, app_id,
+            status="failed",
+            message="同步失败",
+            error=str(error)
+        )
         return error
 
     conn = get_conn()
@@ -1245,6 +1338,12 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
     conn.commit()
     conn.close()
     update_inventory_snapshot_from_raw_items(steam_id, app_id, raw_items)
+    save_account_inventory_sync_status(
+        steam_id, app_id,
+        status="success",
+        message=f"同步成功：共 {len(current_asset_ids)} 个库存物品",
+        error=""
+    )
     return None
 
 
@@ -3064,6 +3163,28 @@ INVENTORY_TEMPLATE = """
 
         <div class="sync-grid">
             <div class="sync-card">
+                <div class="sync-k">当前页面 SteamID</div>
+                <div class="sync-v">{{ steam_id }}</div>
+            </div>
+            <div class="sync-card">
+                <div class="sync-k">该账号上次同步时间</div>
+                <div class="sync-v">{{ account_sync_status.last_sync_at or '-' }}</div>
+            </div>
+            <div class="sync-card">
+                <div class="sync-k">该账号上次同步状态</div>
+                <div class="sync-v">
+                    {% if account_sync_status.last_status == 'success' %}
+                        成功
+                    {% elif account_sync_status.last_status == 'empty' %}
+                        成功（库存为空）
+                    {% elif account_sync_status.last_status == 'failed' %}
+                        失败
+                    {% else %}
+                        暂无记录
+                    {% endif %}
+                </div>
+            </div>
+            <div class="sync-card">
                 <div class="sync-k">当前同步状态</div>
                 <div id="syncStateText" class="sync-v">
                     {% if sync_status.running %}
@@ -3113,6 +3234,12 @@ INVENTORY_TEMPLATE = """
                 暂无失败信息
             {% endif %}
         </div>
+        {% if account_sync_status.last_message %}
+        <div class="sync-note">该账号最近结果：{{ account_sync_status.last_message }}</div>
+        {% endif %}
+        {% if account_sync_status.last_error %}
+        <div class="sync-note">该账号最近错误：{{ account_sync_status.last_error }}</div>
+        {% endif %}
     </div>
 
     <div class="toggle-bar">
@@ -4634,6 +4761,7 @@ def inventory_page(steam_id):
     inventory_filter = request.args.get("inventory_filter", "all").strip()
 
     sync_status = get_sync_state()
+    account_sync_status = get_account_inventory_sync_status(steam_id, app_id)
 
     items = get_inventory_from_db(steam_id, app_id=app_id)
 
@@ -4676,7 +4804,8 @@ def inventory_page(steam_id):
         tradable_count=tradable_count,
         total_market_value=total_market_value,
         total_cost=total_cost,
-        sync_status=sync_status
+        sync_status=sync_status,
+        account_sync_status=account_sync_status
     )
 
 @app.route("/sync/inventory/<steam_id>")
@@ -4691,6 +4820,12 @@ def sync_inventory(steam_id):
         return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error=f"同步库存失败：{result}"))
 
     return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, msg="库存同步成功"))
+
+
+@app.route("/sync/account_status/<steam_id>")
+def sync_account_status_api(steam_id):
+    app_id = request.args.get("appId", DEFAULT_APP_ID)
+    return jsonify(get_account_inventory_sync_status(steam_id, app_id))
 
 
 @app.route("/save_group_price", methods=["POST"])
