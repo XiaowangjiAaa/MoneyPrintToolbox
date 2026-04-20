@@ -1011,6 +1011,44 @@ def lookup_resolved_steam_id_by_asset(app_id, asset_id):
     if row and str(row["steam_id"] or "").strip():
         return str(row["steam_id"]).strip(), "item_purchase_prices"
 
+    # 4) 兜底：忽略 app_id，全库按 asset_id 搜（兼容历史脏数据 app_id 缺失/不一致）
+    cur = get_conn().cursor()
+    cur.execute("""
+    SELECT steam_id
+    FROM asset_ownership_history
+    WHERE asset_id = ?
+    ORDER BY last_seen_at DESC
+    LIMIT 1
+    """, (asset_id,))
+    row = cur.fetchone()
+    if row and str(row["steam_id"] or "").strip():
+        cur.connection.close()
+        return str(row["steam_id"]).strip(), "asset_ownership_history(global)"
+
+    cur.execute("""
+    SELECT steam_id
+    FROM inventory_items
+    WHERE asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (asset_id,))
+    row = cur.fetchone()
+    if row and str(row["steam_id"] or "").strip():
+        cur.connection.close()
+        return str(row["steam_id"]).strip(), "inventory_items(global)"
+
+    cur.execute("""
+    SELECT steam_id
+    FROM item_purchase_prices
+    WHERE asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (asset_id,))
+    row = cur.fetchone()
+    cur.connection.close()
+    if row and str(row["steam_id"] or "").strip():
+        return str(row["steam_id"]).strip(), "item_purchase_prices(global)"
+
     return "", "none"
 
 
@@ -1042,6 +1080,33 @@ def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id=""):
     ORDER BY updated_at DESC
     LIMIT 1
     """, (app_id, asset_id))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return safe_float(row["purchase_price"], 0)
+
+    # 兜底：忽略 app_id
+    conn = get_conn()
+    cur = conn.cursor()
+    if steam_id:
+        cur.execute("""
+        SELECT purchase_price
+        FROM item_purchase_prices
+        WHERE steam_id = ? AND asset_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """, (steam_id, asset_id))
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return safe_float(row["purchase_price"], 0)
+    cur.execute("""
+    SELECT purchase_price
+    FROM item_purchase_prices
+    WHERE asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (asset_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -1077,6 +1142,33 @@ def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id=""):
     ORDER BY updated_at DESC
     LIMIT 1
     """, (app_id, asset_id))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return safe_float(row["cost_price"], 0)
+
+    # 兜底：忽略 app_id
+    conn = get_conn()
+    cur = conn.cursor()
+    if steam_id:
+        cur.execute("""
+        SELECT cost_price
+        FROM inventory_items
+        WHERE steam_id = ? AND asset_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """, (steam_id, asset_id))
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return safe_float(row["cost_price"], 0)
+    cur.execute("""
+    SELECT cost_price
+    FROM inventory_items
+    WHERE asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (asset_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -1628,7 +1720,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     for row in rows:
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
         asset_id = str(row.get("asset_id", "") or "").strip()
-        row_app_id = str(row.get("app_id", "") or "").strip()
+        row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         item_name = str(row.get("name", "") or "")
 
         if not resolved_steam_id and asset_id:
@@ -1778,7 +1870,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     for row in rows:
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
         asset_id = str(row.get("asset_id", "") or "").strip()
-        row_app_id = str(app_id or "")
+        row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         item_name = str(row.get("name", "") or "")
 
         if not resolved_steam_id and asset_id:
@@ -1868,7 +1960,7 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
 
     result = []
     for row in rows:
-        row_app_id = str(row.get("app_id", "") or "").strip()
+        row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         row_asset_id = str(row.get("asset_id", "") or "").strip()
         row_name = str(row.get("name", "") or "")
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
