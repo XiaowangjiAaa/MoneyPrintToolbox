@@ -30,7 +30,10 @@ APP_KEY = load_config()
 DEFAULT_APP_ID = "730"
 DB_PATH = "steam_inventory_app.db"
 FAILED_SYNC_FILE = "failed_inventory_sync.json"
+INVENTORY_SYNC_SUMMARY_FILE = "inventory_sync_summary.json"
 IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cached_images")
+INVENTORY_SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "inventory_snapshots")
+PROFIT_ANALYSIS_CACHE_DIR = os.path.join(os.path.dirname(__file__), "profit_analysis_cache")
 
 
 # =========================
@@ -117,24 +120,50 @@ def request_cancel_sync():
 def _inventory_sync_worker(app_id):
     error = sync_accounts_to_db()
     if error:
+        ended = now_str()
         update_sync_state(
             running=False,
             current_steam_id="",
             last_error=f"同步所有账号失败：{error}",
             last_message="库存同步任务启动失败",
-            ended_at=now_str(),
+            ended_at=ended,
         )
+        save_inventory_sync_summary({
+            "ended_at": ended,
+            "app_id": str(app_id),
+            "total": 0,
+            "synced_count": 0,
+            "success_count": 0,
+            "empty_count": 0,
+            "failed_count": 0,
+            "failed_ids": [],
+            "last_message": "库存同步任务启动失败",
+            "last_error": f"同步所有账号失败：{error}",
+        })
         return
 
     accounts = get_all_accounts_from_db()
     if not accounts:
+        ended = now_str()
         update_sync_state(
             running=False,
             current_steam_id="",
             last_error="没有可用账号，无法同步库存",
             last_message="没有可用账号，无法同步库存",
-            ended_at=now_str(),
+            ended_at=ended,
         )
+        save_inventory_sync_summary({
+            "ended_at": ended,
+            "app_id": str(app_id),
+            "total": 0,
+            "synced_count": 0,
+            "success_count": 0,
+            "empty_count": 0,
+            "failed_count": 0,
+            "failed_ids": [],
+            "last_message": "没有可用账号，无法同步库存",
+            "last_error": "没有可用账号，无法同步库存",
+        })
         return
 
     update_sync_state(
@@ -209,6 +238,7 @@ def _inventory_sync_worker(app_id):
     if len(failed_msgs) > 8:
         last_error += f" ... 其余 {len(failed_msgs) - 8} 个失败"
 
+    ended = now_str()
     update_sync_state(
         running=False,
         cancel_requested=False,
@@ -221,8 +251,20 @@ def _inventory_sync_worker(app_id):
         failed_messages=list(failed_msgs[:20]),
         last_message=last_message,
         last_error=last_error,
-        ended_at=now_str(),
+        ended_at=ended,
     )
+    save_inventory_sync_summary({
+        "ended_at": ended,
+        "app_id": str(app_id),
+        "total": int(final_state["total"] or 0),
+        "synced_count": int(final_state["finished"] or 0),
+        "success_count": int(success_count or 0),
+        "empty_count": int(empty_count or 0),
+        "failed_count": int(len(failed_ids)),
+        "failed_ids": list(failed_ids),
+        "last_message": last_message,
+        "last_error": last_error,
+    })
 
 
 def start_inventory_sync_background(app_id=DEFAULT_APP_ID):
@@ -310,12 +352,14 @@ def init_db():
         app_id TEXT NOT NULL,
         item_key TEXT NOT NULL,
         asset_id TEXT NOT NULL,
+        original_asset_id TEXT,
         token TEXT,
         style_token TEXT,
         name TEXT,
         short_name TEXT,
         image_url TEXT,
         price REAL DEFAULT 0,
+        cost_price REAL DEFAULT 0,
         status INTEGER,
         if_tradable INTEGER DEFAULT 0,
         wear TEXT,
@@ -326,6 +370,13 @@ def init_db():
         UNIQUE(steam_id, app_id, asset_id)
     )
     """)
+    # 兼容旧库：为 inventory_items 增加 cost_price 字段
+    cur.execute("PRAGMA table_info(inventory_items)")
+    inventory_cols = [str(r["name"]) for r in cur.fetchall()]
+    if "cost_price" not in inventory_cols:
+        cur.execute("ALTER TABLE inventory_items ADD COLUMN cost_price REAL DEFAULT 0")
+    if "original_asset_id" not in inventory_cols:
+        cur.execute("ALTER TABLE inventory_items ADD COLUMN original_asset_id TEXT")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS asset_ownership_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -379,6 +430,7 @@ def init_db():
         status_name TEXT,
         order_create_time INTEGER,
         asset_id TEXT,
+        original_asset_id TEXT,
         style_id TEXT,
         wear TEXT,
         weapon_name TEXT,
@@ -386,6 +438,10 @@ def init_db():
         updated_at TEXT
     )
     """)
+    cur.execute("PRAGMA table_info(seller_orders)")
+    order_cols = [str(r["name"]) for r in cur.fetchall()]
+    if "original_asset_id" not in order_cols:
+        cur.execute("ALTER TABLE seller_orders ADD COLUMN original_asset_id TEXT")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sync_meta (
         key TEXT PRIMARY KEY,
@@ -429,6 +485,243 @@ def safe_float(v, default=0.0):
 
 def bool_to_int(v):
     return 1 if v else 0
+
+
+def ensure_inventory_snapshot_dir():
+    try:
+        os.makedirs(INVENTORY_SNAPSHOT_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def get_inventory_snapshot_path(steam_id, app_id):
+    safe_steam = str(steam_id or "").strip()
+    safe_app = str(app_id or "").strip()
+    return os.path.join(INVENTORY_SNAPSHOT_DIR, f"{safe_steam}_{safe_app}.json")
+
+
+def load_inventory_snapshot(steam_id, app_id):
+    ensure_inventory_snapshot_dir()
+    path = get_inventory_snapshot_path(steam_id, app_id)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_inventory_snapshot(steam_id, app_id, snapshot):
+    ensure_inventory_snapshot_dir()
+    path = get_inventory_snapshot_path(steam_id, app_id)
+    payload = snapshot if isinstance(snapshot, dict) else {}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[快照写入失败] {path}: {e}")
+
+
+def list_inventory_snapshot_files():
+    ensure_inventory_snapshot_dir()
+    try:
+        return [os.path.join(INVENTORY_SNAPSHOT_DIR, x) for x in os.listdir(INVENTORY_SNAPSHOT_DIR) if x.endswith(".json")]
+    except Exception:
+        return []
+
+
+def ensure_profit_analysis_cache_dir():
+    try:
+        os.makedirs(PROFIT_ANALYSIS_CACHE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size):
+    ensure_profit_analysis_cache_dir()
+    raw = f"{app_id}|{keyword}|{steam_id}|{page}|{page_size}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return os.path.join(PROFIT_ANALYSIS_CACHE_DIR, f"{digest}.json")
+
+
+def load_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, max_age_seconds=30):
+    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = float(data.get("cached_at_ts", 0) or 0)
+        if ts <= 0:
+            return None
+        if max_age_seconds is not None and max_age_seconds > 0:
+            if (time.time() - ts) > max_age_seconds:
+                return None
+        return data
+    except Exception:
+        return None
+
+
+def save_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, payload):
+    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size)
+    body = {
+        "cached_at_ts": time.time(),
+        "cached_at": now_str(),
+        "app_id": str(app_id or ""),
+        "keyword": keyword or "",
+        "steam_id": steam_id or "",
+        "page": int(page or 1),
+        "page_size": int(page_size or 100),
+    }
+    if isinstance(payload, dict):
+        body.update(payload)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[利润缓存写入失败] {path}: {e}")
+
+
+def clear_profit_analysis_cache():
+    ensure_profit_analysis_cache_dir()
+    try:
+        for x in os.listdir(PROFIT_ANALYSIS_CACHE_DIR):
+            if x.endswith(".json"):
+                try:
+                    os.remove(os.path.join(PROFIT_ANALYSIS_CACHE_DIR, x))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
+    item_info = item.get("itemInfo", {}) or {}
+    asset_info = item.get("assetInfo", {}) or {}
+    asset_id = str(item.get("assetId", "") or "").strip()
+    if not asset_id:
+        return None
+
+    cost_price = safe_float(
+        item.get("purchasePrice",
+                 item.get("costPrice",
+                          item.get("cost",
+                                   item.get("buyPrice", 0)))),
+        0
+    )
+    if cost_price <= 0 and isinstance(existing_entry, dict):
+        cost_price = safe_float(existing_entry.get("cost_price", 0), 0)
+
+    return {
+        "steamId": str(steam_id or "").strip(),
+        "appId": str(app_id or "").strip(),
+        "assetId": asset_id,
+        "originalAssetId": str(asset_info.get("originalAssetId", "") or "").strip(),
+        # 兼容旧快照字段
+        "steam_id": str(steam_id or "").strip(),
+        "app_id": str(app_id or "").strip(),
+        "asset_id": asset_id,
+        "original_asset_id": str(asset_info.get("originalAssetId", "") or "").strip(),
+        "name": item.get("name", ""),
+        "short_name": item.get("shortName", ""),
+        "price": safe_float(item.get("price", 0), 0),
+        "costPrice": cost_price,
+        "cost_price": cost_price,
+        "status": int(item.get("status", 0) or 0),
+        "if_tradable": bool_to_int(item.get("ifTradable", False)),
+        "style_id": str(asset_info.get("styleId", "") or ""),
+        "wear": str(asset_info.get("wear", "") or ""),
+        "weapon_name": item_info.get("weaponName", ""),
+        "exterior_name": item_info.get("exteriorName", ""),
+        "updatedAt": now_str(),
+        "updated_at": now_str(),
+    }
+
+
+def update_inventory_snapshot_from_raw_items(steam_id, app_id, raw_items):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    if not steam_id or not app_id:
+        return
+
+    snapshot = load_inventory_snapshot(steam_id, app_id)
+    new_snapshot = {}
+    for item in (raw_items or []):
+        asset_id = str(item.get("assetId", "") or "").strip()
+        if not asset_id:
+            continue
+        entry = build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=snapshot.get(asset_id))
+        if entry:
+            new_snapshot[asset_id] = entry
+
+    save_inventory_snapshot(steam_id, app_id, new_snapshot)
+
+
+def update_inventory_snapshot_cost(steam_id, app_id, asset_id, cost_price):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    asset_id = str(asset_id or "").strip()
+    if not steam_id or not app_id or not asset_id:
+        return
+
+    snapshot = load_inventory_snapshot(steam_id, app_id)
+    entry = snapshot.get(asset_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    normalized_cost = safe_float(cost_price, 0)
+    now = now_str()
+    entry["steamId"] = steam_id
+    entry["appId"] = app_id
+    entry["assetId"] = asset_id
+    entry["costPrice"] = normalized_cost
+    entry["updatedAt"] = now
+    # 兼容旧字段
+    entry["steam_id"] = steam_id
+    entry["app_id"] = app_id
+    entry["asset_id"] = asset_id
+    entry["cost_price"] = normalized_cost
+    entry["updated_at"] = now
+    snapshot[asset_id] = entry
+    save_inventory_snapshot(steam_id, app_id, snapshot)
+
+
+def find_asset_in_snapshots(asset_id, app_id=None):
+    asset_id = str(asset_id or "").strip()
+    app_id = str(app_id or "").strip() if app_id is not None else ""
+    if not asset_id:
+        return []
+
+    hits = []
+    for path in list_inventory_snapshot_files():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            direct = data.get(asset_id)
+            if isinstance(direct, dict):
+                entry_app_id = str(direct.get("appId", direct.get("app_id", "")) or "").strip()
+                if not (app_id and entry_app_id and entry_app_id != app_id):
+                    hits.append(direct)
+            for v in data.values():
+                if not isinstance(v, dict):
+                    continue
+                orig = str(v.get("originalAssetId", v.get("original_asset_id", "")) or "").strip()
+                aid = str(v.get("assetId", v.get("asset_id", "")) or "").strip()
+                if orig != asset_id and aid != asset_id:
+                    continue
+                entry_app_id = str(v.get("appId", v.get("app_id", "")) or "").strip()
+                if app_id and entry_app_id and entry_app_id != app_id:
+                    continue
+                hits.append(v)
+        except Exception:
+            continue
+    hits.sort(key=lambda x: str(x.get("updatedAt", x.get("updated_at", "")) or ""), reverse=True)
+    return hits
 
 
 def ensure_image_cache_dir():
@@ -517,6 +810,24 @@ def load_failed_sync_ids():
             return data.get("failed_ids", [])
     except Exception:
         return []
+
+
+def save_inventory_sync_summary(summary):
+    payload = summary if isinstance(summary, dict) else {}
+    try:
+        with open(INVENTORY_SYNC_SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[写入库存同步摘要失败] {e}")
+
+
+def load_inventory_sync_summary():
+    try:
+        with open(INVENTORY_SYNC_SUMMARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def translate_status(status):
@@ -823,6 +1134,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
             conn.commit()
             conn.close()
+            save_inventory_snapshot(steam_id, app_id, {})
 
             return "empty"   # 特殊状态：库存为空，但同步成功
         return error
@@ -840,6 +1152,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
         asset_id = str(item.get("assetId", "") or "").strip()
         if not asset_id:
             continue
+        original_asset_id = str(asset_info.get("originalAssetId", "") or "").strip()
 
         current_asset_ids.add(asset_id)
         upsert_asset_owner(cur, app_id=app_id, asset_id=asset_id, steam_id=steam_id, current_time=current_time)
@@ -851,6 +1164,13 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
         short_name = item.get("shortName", "")
         image_url = cache_image_and_get_local_url(item.get("imageUrl", ""))
         price = safe_float(item.get("price", 0))
+        cost_price = safe_float(
+            item.get("purchasePrice",
+                     item.get("costPrice",
+                              item.get("cost",
+                                       item.get("buyPrice", 0)))),
+            0
+        )
         status = int(item.get("status", 0) or 0)
         if_tradable = bool_to_int(item.get("ifTradable", False))
         wear = asset_info.get("wear", "")
@@ -860,19 +1180,24 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
         cur.execute("""
         INSERT INTO inventory_items (
-            steam_id, app_id, item_key, asset_id, token, style_token,
-            name, short_name, image_url, price,
+            steam_id, app_id, item_key, asset_id, original_asset_id, token, style_token,
+            name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
             item_key=excluded.item_key,
+            original_asset_id=excluded.original_asset_id,
             token=excluded.token,
             style_token=excluded.style_token,
             name=excluded.name,
             short_name=excluded.short_name,
             image_url=excluded.image_url,
             price=excluded.price,
+            cost_price=CASE
+                WHEN excluded.cost_price > 0 THEN excluded.cost_price
+                ELSE inventory_items.cost_price
+            END,
             status=excluded.status,
             if_tradable=excluded.if_tradable,
             wear=excluded.wear,
@@ -881,10 +1206,21 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             exterior_name=excluded.exterior_name,
             updated_at=excluded.updated_at
         """, (
-            steam_id, app_id, item_key, asset_id, token, style_token,
-            name, short_name, image_url, price,
+            steam_id, app_id, item_key, asset_id, original_asset_id, token, style_token,
+            name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, current_time
         ))
+        if cost_price > 0:
+            cur.execute("""
+            INSERT INTO item_purchase_prices (steam_id, app_id, asset_id, purchase_price, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
+                purchase_price=CASE
+                    WHEN excluded.purchase_price > 0 THEN excluded.purchase_price
+                    ELSE item_purchase_prices.purchase_price
+                END,
+                updated_at=excluded.updated_at
+            """, (steam_id, app_id, asset_id, cost_price, current_time))
 
     # 删除本次同步中已经不存在的旧库存记录
     cur.execute("""
@@ -908,6 +1244,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
     conn.commit()
     conn.close()
+    update_inventory_snapshot_from_raw_items(steam_id, app_id, raw_items)
     return None
 
 
@@ -933,6 +1270,275 @@ def build_asset_owner_map(app_id=DEFAULT_APP_ID):
         if asset_id and steam_id and asset_id not in owner_map:
             owner_map[asset_id] = steam_id
     return owner_map
+
+
+def build_asset_candidates(asset_id, original_asset_id=""):
+    candidates = []
+    a1 = str(asset_id or "").strip()
+    a2 = str(original_asset_id or "").strip()
+    # 订单侧优先 originalAssetId（通常更接近库存侧的 assetId）
+    if a2:
+        candidates.append(a2)
+    if a1 and a1 not in candidates:
+        candidates.append(a1)
+    return candidates
+
+
+def lookup_resolved_steam_id_by_asset(app_id, asset_id, original_asset_id=""):
+    app_id = str(app_id or "").strip()
+    candidates = build_asset_candidates(asset_id, original_asset_id)
+    if not app_id or not candidates:
+        return "", "none"
+
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        # 1) 先查归属历史（最稳定）
+        cur.execute("""
+    SELECT steam_id
+    FROM asset_ownership_history
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY last_seen_at DESC
+    LIMIT 1
+        """, (app_id, candidate))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            conn.close()
+            return str(row["steam_id"]).strip(), "asset_ownership_history"
+        # 2) 再查当前库存
+        cur.execute("""
+    SELECT steam_id
+    FROM inventory_items
+    WHERE app_id = ? AND (asset_id = ? OR original_asset_id = ?)
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, candidate, candidate))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            conn.close()
+            return str(row["steam_id"]).strip(), "inventory_items"
+        # 3) 单品成本记录
+        cur.execute("""
+    SELECT steam_id
+    FROM item_purchase_prices
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+        """, (app_id, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row and str(row["steam_id"] or "").strip():
+            return str(row["steam_id"]).strip(), "item_purchase_prices"
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id)
+        if snapshot_hits:
+            steam = str(snapshot_hits[0].get("steamId", snapshot_hits[0].get("steam_id", "")) or "").strip()
+            if steam:
+                return steam, "snapshot(app)"
+
+    # 5) 兜底：忽略 app_id，全库按 asset_id 搜（兼容历史脏数据 app_id 缺失/不一致）
+    cur = get_conn().cursor()
+    for candidate in candidates:
+        cur.execute("""
+    SELECT steam_id
+    FROM asset_ownership_history
+    WHERE asset_id = ?
+    ORDER BY last_seen_at DESC
+    LIMIT 1
+    """, (candidate,))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            cur.connection.close()
+            return str(row["steam_id"]).strip(), "asset_ownership_history(global)"
+
+        cur.execute("""
+    SELECT steam_id
+    FROM inventory_items
+    WHERE asset_id = ? OR original_asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (candidate, candidate))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            cur.connection.close()
+            return str(row["steam_id"]).strip(), "inventory_items(global)"
+
+        cur.execute("""
+    SELECT steam_id
+    FROM item_purchase_prices
+    WHERE asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (candidate,))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            cur.connection.close()
+            return str(row["steam_id"]).strip(), "item_purchase_prices(global)"
+
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=None)
+        if snapshot_hits:
+            steam = str(snapshot_hits[0].get("steamId", snapshot_hits[0].get("steam_id", "")) or "").strip()
+            if steam:
+                cur.connection.close()
+                return steam, "snapshot(global)"
+    cur.connection.close()
+
+    return "", "none"
+
+
+def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id="", original_asset_id=""):
+    app_id = str(app_id or "").strip()
+    steam_id = str(steam_id or "").strip()
+    candidates = build_asset_candidates(asset_id, original_asset_id)
+    if not app_id or not candidates:
+        return 0.0
+
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
+        SELECT purchase_price
+        FROM item_purchase_prices
+        WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+        LIMIT 1
+        """, (steam_id, app_id, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["purchase_price"], 0)
+
+        cur.execute("""
+    SELECT purchase_price
+    FROM item_purchase_prices
+    WHERE app_id = ? AND asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["purchase_price"], 0)
+
+    # 兜底：忽略 app_id
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
+        SELECT purchase_price
+        FROM item_purchase_prices
+        WHERE steam_id = ? AND asset_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """, (steam_id, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["purchase_price"], 0)
+        cur.execute("""
+    SELECT purchase_price
+    FROM item_purchase_prices
+    WHERE asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (candidate,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["purchase_price"], 0)
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id if app_id else None)
+        if steam_id:
+            for hit in snapshot_hits:
+                if str(hit.get("steamId", hit.get("steam_id", "")) or "").strip() == steam_id:
+                    return safe_float(hit.get("costPrice", hit.get("cost_price", 0)), 0)
+        if snapshot_hits:
+            return safe_float(snapshot_hits[0].get("costPrice", snapshot_hits[0].get("cost_price", 0)), 0)
+    return 0.0
+
+
+def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id="", original_asset_id=""):
+    app_id = str(app_id or "").strip()
+    steam_id = str(steam_id or "").strip()
+    candidates = build_asset_candidates(asset_id, original_asset_id)
+    if not app_id or not candidates:
+        return 0.0
+
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
+        SELECT cost_price
+        FROM inventory_items
+        WHERE steam_id = ? AND app_id = ? AND (asset_id = ? OR original_asset_id = ?)
+        LIMIT 1
+        """, (steam_id, app_id, candidate, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["cost_price"], 0)
+
+        cur.execute("""
+    SELECT cost_price
+    FROM inventory_items
+    WHERE app_id = ? AND (asset_id = ? OR original_asset_id = ?)
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (app_id, candidate, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["cost_price"], 0)
+
+    # 兜底：忽略 app_id
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
+        SELECT cost_price
+        FROM inventory_items
+        WHERE steam_id = ? AND (asset_id = ? OR original_asset_id = ?)
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """, (steam_id, candidate, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["cost_price"], 0)
+        cur.execute("""
+    SELECT cost_price
+    FROM inventory_items
+    WHERE asset_id = ? OR original_asset_id = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+    """, (candidate, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["cost_price"], 0)
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id if app_id else None)
+        if steam_id:
+            for hit in snapshot_hits:
+                if str(hit.get("steamId", hit.get("steam_id", "")) or "").strip() == steam_id:
+                    return safe_float(hit.get("costPrice", hit.get("cost_price", 0)), 0)
+        if snapshot_hits:
+            return safe_float(snapshot_hits[0].get("costPrice", snapshot_hits[0].get("cost_price", 0)), 0)
+    return 0.0
+
+
+def lookup_account_name(steam_id):
+    steam_id = str(steam_id or "").strip()
+    if not steam_id:
+        return "", ""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT nickname, username FROM steam_accounts WHERE steam_id = ? LIMIT 1", (steam_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return "", ""
+    return row["nickname"] or "", row["username"] or ""
 
 
 def upsert_asset_owner(cur, app_id, asset_id, steam_id, current_time):
@@ -1002,6 +1608,7 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 status_name = order.get("statusName", "")
                 order_create_time = int(order.get("orderCreateTime", 0) or 0)
                 asset_id = str(asset_info.get("assetId", "") or "")
+                original_asset_id = str(asset_info.get("originalAssetId", "") or "")
                 style_id = str(asset_info.get("styleId", "") or "")
                 wear = str(asset_info.get("wear", "") or "")
                 weapon_name = item_info.get("weaponName", "")
@@ -1011,6 +1618,9 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                     continue
                 if not steam_id and asset_id:
                     steam_id = asset_owner_map.get(asset_id, "")
+                if steam_id and asset_id:
+                    upsert_asset_owner(cur, app_id=app_id, asset_id=asset_id, steam_id=steam_id, current_time=current_time)
+                    asset_owner_map[asset_id] = steam_id
 
                 # 增量同步：遇到上次同步边界数据后，提前终止后续翻页
                 if last_synced_time > 0:
@@ -1025,9 +1635,9 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 INSERT INTO seller_orders (
                     order_id, steam_id, product_id, app_id, item_id, name, market_hash_name,
                     image_url, order_price, order_status, status_name, order_create_time,
-                    asset_id, style_id, wear, weapon_name, exterior_name, updated_at
+                    asset_id, original_asset_id, style_id, wear, weapon_name, exterior_name, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     steam_id=excluded.steam_id,
                     product_id=excluded.product_id,
@@ -1041,6 +1651,7 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                     status_name=excluded.status_name,
                     order_create_time=excluded.order_create_time,
                     asset_id=excluded.asset_id,
+                    original_asset_id=excluded.original_asset_id,
                     style_id=excluded.style_id,
                     wear=excluded.wear,
                     weapon_name=excluded.weapon_name,
@@ -1049,7 +1660,7 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 """, (
                     order_id, steam_id, product_id, str(app_id), item_id, name, market_hash_name,
                     image_url, order_price, order_status, status_name, order_create_time,
-                    asset_id, style_id, wear, weapon_name, exterior_name, current_time
+                    asset_id, original_asset_id, style_id, wear, weapon_name, exterior_name, current_time
                 ))
                 processed_orders += 1
                 new_orders += 1
@@ -1138,6 +1749,7 @@ def get_inventory_from_db(steam_id, app_id=DEFAULT_APP_ID):
         i.short_name,
         i.image_url,
         i.price,
+        i.cost_price,
         i.status,
         i.if_tradable,
         i.wear,
@@ -1145,7 +1757,7 @@ def get_inventory_from_db(steam_id, app_id=DEFAULT_APP_ID):
         i.weapon_name,
         i.exterior_name,
         i.updated_at,
-        COALESCE(p.purchase_price, 0) AS purchase_price
+        COALESCE(p.purchase_price, i.cost_price, 0) AS purchase_price
     FROM inventory_items i
     LEFT JOIN item_purchase_prices p
       ON i.steam_id = p.steam_id
@@ -1203,15 +1815,23 @@ def save_group_default_purchase_price(steam_id, app_id, group_name, price):
 def save_item_purchase_price(steam_id, app_id, asset_id, purchase_price):
     conn = get_conn()
     cur = conn.cursor()
+    normalized_price = safe_float(purchase_price, 0)
+    current_time = now_str()
     cur.execute("""
     INSERT INTO item_purchase_prices (steam_id, app_id, asset_id, purchase_price, updated_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
         purchase_price=excluded.purchase_price,
         updated_at=excluded.updated_at
-    """, (steam_id, app_id, asset_id, safe_float(purchase_price, 0), now_str()))
+    """, (steam_id, app_id, asset_id, normalized_price, current_time))
+    cur.execute("""
+    UPDATE inventory_items
+    SET cost_price = ?, updated_at = ?
+    WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+    """, (normalized_price, current_time, steam_id, app_id, asset_id))
     conn.commit()
     conn.close()
+    update_inventory_snapshot_cost(steam_id, app_id, asset_id, normalized_price)
 
 
 def apply_group_price_to_items(steam_id, app_id, group_name, price):
@@ -1240,8 +1860,18 @@ def apply_group_price_to_items(steam_id, app_id, group_name, price):
             updated_at=excluded.updated_at
         """, (steam_id, app_id, asset_id, normalized_price, current_time))
 
+    cur.execute("""
+    UPDATE inventory_items
+    SET cost_price = ?, updated_at = ?
+    WHERE steam_id = ? AND app_id = ? AND name = ?
+    """, (normalized_price, current_time, steam_id, app_id, group_name))
+
     conn.commit()
     conn.close()
+    for row in rows:
+        aid = str(row["asset_id"] or "").strip()
+        if aid:
+            update_inventory_snapshot_cost(steam_id, app_id, aid, normalized_price)
 
 
 def group_inventory_by_name(items, steam_id, app_id):
@@ -1342,23 +1972,33 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         o.status_name,
         o.order_create_time,
         o.asset_id,
+        o.original_asset_id,
         o.style_id,
         o.wear,
         o.weapon_name,
         o.exterior_name,
+        COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
         a.nickname,
         a.username,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
-        COALESCE(g.default_purchase_price, 0) AS group_purchase_price
+        COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(iv.cost_price, 0) AS inventory_cost_price
     FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
+    LEFT JOIN inventory_items iv
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON o.steam_id = a.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
     LEFT JOIN item_purchase_prices p
-      ON o.steam_id = p.steam_id
-     AND o.app_id = p.app_id
-     AND o.asset_id = p.asset_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = p.steam_id
+      AND o.app_id = p.app_id
+      AND o.asset_id = p.asset_id
     LEFT JOIN group_purchase_prices g
-      ON o.steam_id = g.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = g.steam_id
      AND o.app_id = g.app_id
      AND o.name = g.group_name
     WHERE o.app_id = ?
@@ -1366,15 +2006,22 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     count_sql = """
     SELECT COUNT(1) AS total
     FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
+    LEFT JOIN inventory_items iv
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON o.steam_id = a.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
     WHERE o.app_id = ?
     """
     params = [str(app_id)]
     where_clauses = []
 
     if steam_id:
-        where_clauses.append("o.steam_id = ?")
+        where_clauses.append("COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?")
         params.append(steam_id)
     keyword = (keyword or "").strip().lower()
     if keyword:
@@ -1387,7 +2034,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
                 "o.product_id = ?",
                 "o.asset_id = ?",
                 "o.style_id = ?",
-                "o.steam_id = ?",
+                "COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?",
             ])
             exact_params.extend([keyword] * 5)
 
@@ -1428,22 +2075,60 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     conn.close()
 
     result = []
+    resolved_cache = {}
+    item_cost_cache = {}
+    inv_cost_cache = {}
+    account_cache = {}
 
     for row in rows:
+        resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
+        asset_id = str(row.get("asset_id", "") or "").strip()
+        original_asset_id = str(row.get("original_asset_id", "") or "").strip()
+        row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
+        item_name = str(row.get("name", "") or "")
+
+        if not resolved_steam_id and asset_id:
+            k = (row_app_id, asset_id, original_asset_id)
+            if k not in resolved_cache:
+                resolved_cache[k] = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
+            resolved_steam_id, _ = resolved_cache[k]
+
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        if item_cost <= 0 and asset_id:
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in item_cost_cache:
+                item_cost_cache[k] = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            item_cost = item_cost_cache[k]
+
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
-        cost_price = item_cost if item_cost > 0 else group_cost
+        if group_cost <= 0 and resolved_steam_id and item_name:
+            group_cost = get_group_default_purchase_price(resolved_steam_id, row_app_id, item_name)
+
+        inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        if inventory_cost <= 0 and asset_id:
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in inv_cost_cache:
+                inv_cost_cache[k] = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            inventory_cost = inv_cost_cache[k]
+        cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
 
         order_price = safe_float(row.get("order_price", 0), 0)
         profit = order_price - cost_price
         counted_in_profit = cost_price > 0
 
+        nickname = row.get("nickname", "")
+        username = row.get("username", "")
+        if resolved_steam_id and (not nickname and not username):
+            if resolved_steam_id not in account_cache:
+                account_cache[resolved_steam_id] = lookup_account_name(resolved_steam_id)
+            nickname, username = account_cache[resolved_steam_id]
+
         record = {
             "order_id": str(row.get("order_id", "") or ""),
-            "steam_id": str(row.get("steam_id", "") or ""),
+            "steam_id": resolved_steam_id,
             "product_id": str(row.get("product_id", "") or ""),
             "app_id": str(row.get("app_id", "") or ""),
-            "name": row.get("name", ""),
+            "name": item_name,
             "market_hash_name": row.get("market_hash_name", ""),
             "image_url": cache_image_and_get_local_url(row.get("image_url", "")),
             "order_price": order_price,
@@ -1451,13 +2136,14 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
             "status_name": row.get("status_name", ""),
             "order_create_time": int(row.get("order_create_time", 0) or 0),
             "order_create_time_str": unix_ms_to_str(row.get("order_create_time", 0)),
-            "asset_id": str(row.get("asset_id", "") or ""),
+            "asset_id": asset_id,
+            "original_asset_id": original_asset_id,
             "style_id": str(row.get("style_id", "") or ""),
             "wear": str(row.get("wear", "") or ""),
             "weapon_name": row.get("weapon_name", ""),
             "exterior_name": row.get("exterior_name", ""),
-            "nickname": row.get("nickname", ""),
-            "username": row.get("username", ""),
+            "nickname": nickname,
+            "username": username,
             "cost_price": cost_price,
             "profit": profit,
             "counted_in_profit": counted_in_profit,
@@ -1478,11 +2164,13 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         o.order_price,
         COALESCE(p.purchase_price, 0) AS item_purchase_price,
         COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(iv.cost_price, 0) AS inventory_cost_price,
         o.name,
         o.market_hash_name,
         o.asset_id,
+        o.original_asset_id,
         o.style_id,
-        o.steam_id,
+        COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
         o.weapon_name,
         o.exterior_name,
         o.order_id,
@@ -1490,14 +2178,21 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         a.nickname,
         a.username
     FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
+    LEFT JOIN inventory_items iv
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
     LEFT JOIN steam_accounts a
-      ON o.steam_id = a.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
     LEFT JOIN item_purchase_prices p
-      ON o.steam_id = p.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = p.steam_id
      AND o.app_id = p.app_id
      AND o.asset_id = p.asset_id
     LEFT JOIN group_purchase_prices g
-      ON o.steam_id = g.steam_id
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = g.steam_id
      AND o.app_id = g.app_id
      AND o.name = g.group_name
     WHERE o.app_id = ?
@@ -1506,7 +2201,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     where_clauses = []
 
     if steam_id:
-        where_clauses.append("o.steam_id = ?")
+        where_clauses.append("COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?")
         params.append(steam_id)
 
     keyword = (keyword or "").strip().lower()
@@ -1519,7 +2214,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
                 "o.product_id = ?",
                 "o.asset_id = ?",
                 "o.style_id = ?",
-                "o.steam_id = ?",
+                "COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = ?",
             ])
             exact_params.extend([keyword] * 5)
 
@@ -1549,10 +2244,40 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     conn.close()
 
     daily = defaultdict(float)
+    resolved_cache = {}
+    item_cost_cache = {}
+    inv_cost_cache = {}
     for row in rows:
+        resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
+        asset_id = str(row.get("asset_id", "") or "").strip()
+        original_asset_id = str(row.get("original_asset_id", "") or "").strip()
+        row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
+        item_name = str(row.get("name", "") or "")
+
+        if not resolved_steam_id and asset_id:
+            k = (row_app_id, asset_id, original_asset_id)
+            if k not in resolved_cache:
+                resolved_cache[k] = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
+            resolved_steam_id, _ = resolved_cache[k]
+
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        if item_cost <= 0 and asset_id:
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in item_cost_cache:
+                item_cost_cache[k] = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            item_cost = item_cost_cache[k]
+
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
-        cost_price = item_cost if item_cost > 0 else group_cost
+        if group_cost <= 0 and resolved_steam_id and item_name:
+            group_cost = get_group_default_purchase_price(resolved_steam_id, row_app_id, item_name)
+
+        inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        if inventory_cost <= 0 and asset_id:
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in inv_cost_cache:
+                inv_cost_cache[k] = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            inventory_cost = inv_cost_cache[k]
+        cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
         if cost_price <= 0:
             continue
 
@@ -1569,6 +2294,148 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     ordered = sorted(daily.items(), key=lambda x: x[0])
     ordered = ordered[-max(1, int(days)):]
     return [{"day": d[5:], "profit": round(v, 2)} for d, v in ordered]
+
+
+def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=200):
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        return []
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT
+        o.order_id,
+        o.order_price,
+        o.order_status,
+        o.status_name,
+        o.order_create_time,
+        o.app_id,
+        o.asset_id,
+        o.original_asset_id,
+        o.name,
+        o.market_hash_name,
+        o.steam_id AS order_steam_id,
+        ah.steam_id AS owner_steam_id,
+        COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
+        a.nickname,
+        a.username,
+        COALESCE(p.purchase_price, 0) AS item_purchase_price,
+        COALESCE(g.default_purchase_price, 0) AS group_purchase_price,
+        COALESCE(iv.cost_price, 0) AS inventory_cost_price
+    FROM seller_orders o
+    LEFT JOIN asset_ownership_history ah
+      ON o.app_id = ah.app_id
+     AND o.asset_id = ah.asset_id
+    LEFT JOIN steam_accounts a
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = a.steam_id
+    LEFT JOIN item_purchase_prices p
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = p.steam_id
+     AND o.app_id = p.app_id
+     AND o.asset_id = p.asset_id
+    LEFT JOIN group_purchase_prices g
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = g.steam_id
+     AND o.app_id = g.app_id
+     AND o.name = g.group_name
+    LEFT JOIN inventory_items iv
+      ON COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) = iv.steam_id
+     AND o.app_id = iv.app_id
+     AND o.asset_id = iv.asset_id
+    WHERE o.app_id = ?
+      AND o.asset_id = ?
+    ORDER BY o.order_create_time DESC, o.order_id DESC
+    LIMIT ?
+    """, (str(app_id), asset_id, max(1, int(limit or 200))))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    result = []
+    resolved_cache = {}
+    item_cost_cache = {}
+    inv_cost_cache = {}
+    account_cache = {}
+    for row in rows:
+        row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
+        row_asset_id = str(row.get("asset_id", "") or "").strip()
+        row_original_asset_id = str(row.get("original_asset_id", "") or "").strip()
+        row_name = str(row.get("name", "") or "")
+        resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
+        resolve_source = "order_or_history"
+
+        if not resolved_steam_id and row_asset_id:
+            k = (row_app_id, row_asset_id, row_original_asset_id)
+            if k not in resolved_cache:
+                resolved_cache[k] = lookup_resolved_steam_id_by_asset(row_app_id, row_asset_id, row_original_asset_id)
+            resolved_steam_id, resolve_source = resolved_cache[k]
+
+        item_cost = safe_float(row.get("item_purchase_price", 0), 0)
+        if item_cost <= 0 and row_asset_id:
+            k = (row_app_id, row_asset_id, row_original_asset_id, resolved_steam_id)
+            if k not in item_cost_cache:
+                item_cost_cache[k] = lookup_item_purchase_price_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
+            item_cost = item_cost_cache[k]
+
+        group_cost = safe_float(row.get("group_purchase_price", 0), 0)
+        if group_cost <= 0 and resolved_steam_id and row_name:
+            group_cost = get_group_default_purchase_price(resolved_steam_id, row_app_id, row_name)
+
+        inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
+        if inventory_cost <= 0 and row_asset_id:
+            k = (row_app_id, row_asset_id, row_original_asset_id, resolved_steam_id)
+            if k not in inv_cost_cache:
+                inv_cost_cache[k] = lookup_inventory_cost_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
+            inventory_cost = inv_cost_cache[k]
+
+        if item_cost > 0:
+            cost_source = "单品成本(item_purchase_prices)"
+            hit_cost = item_cost
+        elif group_cost > 0:
+            cost_source = "分组成本(group_purchase_prices)"
+            hit_cost = group_cost
+        elif inventory_cost > 0:
+            cost_source = "库存成本(inventory_items.cost_price)"
+            hit_cost = inventory_cost
+        else:
+            cost_source = "未命中成本"
+            hit_cost = 0
+
+        order_price = safe_float(row.get("order_price", 0), 0)
+        profit = order_price - hit_cost
+
+        nickname = row.get("nickname", "")
+        username = row.get("username", "")
+        if resolved_steam_id and (not nickname and not username):
+            if resolved_steam_id not in account_cache:
+                account_cache[resolved_steam_id] = lookup_account_name(resolved_steam_id)
+            nickname, username = account_cache[resolved_steam_id]
+
+        result.append({
+            "order_id": str(row.get("order_id", "") or ""),
+            "order_create_time": int(row.get("order_create_time", 0) or 0),
+            "order_create_time_str": unix_ms_to_str(row.get("order_create_time", 0)),
+            "order_status": int(row.get("order_status", 0) or 0),
+            "status_name": str(row.get("status_name", "") or ""),
+            "name": row.get("name", ""),
+            "market_hash_name": row.get("market_hash_name", ""),
+            "asset_id": row_asset_id,
+            "original_asset_id": row_original_asset_id,
+            "app_id": str(row.get("app_id", "") or ""),
+            "order_price": order_price,
+            "order_steam_id": str(row.get("order_steam_id", "") or ""),
+            "owner_steam_id": str(row.get("owner_steam_id", "") or ""),
+            "resolved_steam_id": resolved_steam_id,
+            "resolve_source": resolve_source,
+            "nickname": nickname,
+            "username": username,
+            "item_purchase_price": item_cost,
+            "group_purchase_price": group_cost,
+            "inventory_cost_price": inventory_cost,
+            "hit_cost": hit_cost,
+            "cost_source": cost_source,
+            "profit": profit,
+        })
+
+    return result
 
 
 def build_profit_summary(rows):
@@ -1714,6 +2581,9 @@ ACCOUNTS_TEMPLATE = """
         .progress-bar { width:100%; height:14px; background:#0f1727; border-radius:999px; overflow:hidden; border:1px solid #30465f; }
         .progress-inner { height:100%; background:#2563eb; width:0%; transition:width .2s ease; }
         .sync-note { margin-top: 10px; color:#8ca3c7; font-size:13px; line-height:1.5; }
+        .failed-box { margin-top: 12px; padding: 10px 12px; border-radius: 12px; border:1px solid rgba(212,68,68,0.4); background: rgba(74,19,24,0.35); }
+        .failed-title { color:#ffd6d6; font-size:13px; margin-bottom:6px; font-weight:700; }
+        .failed-list { color:#ffd6d6; font-size:12px; line-height:1.5; word-break:break-all; max-height:90px; overflow:auto; }
     </style>
 </head>
 <body>
@@ -1794,12 +2664,35 @@ ACCOUNTS_TEMPLATE = """
                 暂无失败信息
             {% endif %}
         </div>
+        <div class="failed-box">
+            <div class="failed-title">当前失败账号（待重试）</div>
+            <div id="failedIdsList" class="failed-list">
+                {% if failed_ids %}
+                    {{ failed_ids|join(' / ') }}
+                {% else %}
+                    暂无失败账号
+                {% endif %}
+            </div>
+        </div>
     </div>
 
     <div class="stats">
         <div class="stat">
             <div class="stat-label">账号总数</div>
             <div class="stat-value">{{ steam_accounts|length }}</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">上次库存同步时间</div>
+            <div class="stat-value" style="font-size:20px;">{{ last_sync_summary.ended_at or '-' }}</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">上次同步：已同步 / 失败</div>
+            <div class="stat-value" style="font-size:20px;">
+                {{ last_sync_summary.synced_count or 0 }} / {{ last_sync_summary.failed_count or 0 }}
+            </div>
+            <div class="sub" style="margin-top:8px;">
+                未同步账号：{{ (last_sync_summary.failed_ids or [])|join(' / ') if (last_sync_summary.failed_ids or []) else '无' }}
+            </div>
         </div>
     </div>
 
@@ -1897,6 +2790,16 @@ async function refreshSyncStatus() {
             const finished = Number(data.finished || 0);
             const percent = total > 0 ? Math.min(100, (finished * 100 / total)) : 0;
             progressBar.style.width = percent + '%';
+        }
+
+        const failedNode = document.getElementById('failedIdsList');
+        if (failedNode) {
+            const failedResp = await fetch('/sync/failed_ids', { cache: 'no-store' });
+            if (failedResp.ok) {
+                const failedData = await failedResp.json();
+                const ids = failedData.failed_ids || [];
+                failedNode.textContent = ids.length ? ids.join(' / ') : '暂无失败账号';
+            }
         }
     } catch (e) {
         console.log('refresh sync status failed', e);
@@ -2423,7 +3326,7 @@ INVENTORY_TEMPLATE = """
                     </div>
 
                     <div class="action-stack">
-                        <form class="compact-price-form" method="post" action="/save_item_price">
+                        <form class="compact-price-form cost-save-form" method="post" action="/save_item_price">
                             <input type="hidden" name="steam_id" value="{{ steam_id }}">
                             <input type="hidden" name="app_id" value="{{ app_id }}">
                             <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
@@ -2561,6 +3464,54 @@ function applyFilters() {
 }
 
 if (searchInput) searchInput.addEventListener("input", applyFilters);
+
+// 成本价改为异步保存，避免整页刷新导致先跳到顶部再回到当前位置。
+document.querySelectorAll(".cost-save-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const priceInput = form.querySelector('input[name="purchase_price"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "保存中...";
+        }
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "保存失败");
+            }
+
+            if (submitBtn) submitBtn.textContent = "已保存";
+            const card = form.closest(".detail-row");
+            const priceBox = card ? card.querySelector(".num-box") : null;
+            const v = Number(priceInput ? priceInput.value : "0");
+            if (priceBox && !Number.isNaN(v)) {
+                priceBox.textContent = "¥ " + v.toFixed(2);
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "保存成本价";
+                }, 900);
+            }
+        }
+    });
+});
 </script>
 </body>
 </html>
@@ -2675,8 +3626,20 @@ ALL_INVENTORY_TEMPLATE = """
             cursor: pointer;
             font-size: 13px;
         }
+        .save-btn {
+            padding: 10px 12px;
+            border: 0;
+            border-radius: 10px;
+            background: #0f9d58;
+            color: white;
+            cursor: pointer;
+            font-size: 13px;
+        }
         .sell-btn:hover {
             background: #b45309;
+        }
+        .save-btn:hover {
+            background: #0c7e47;
         }
 
         @media (max-width: 1350px) {
@@ -2696,6 +3659,14 @@ ALL_INVENTORY_TEMPLATE = """
         <div class="toolbar">
              <form method="get" action="/all_inventory" style="display:flex; gap:10px; flex-wrap:wrap;">
                 <input class="input" type="text" name="q" value="{{ keyword }}" placeholder="搜索 名称 / assetId / styleId / SteamID / 昵称">
+                <select class="select-input" name="steam_id" style="width:240px;">
+                    <option value="">全部账号</option>
+                    {% for acc in accounts %}
+                    <option value="{{ acc.steam_id }}" {{ 'selected' if selected_steam_id == acc.steam_id else '' }}>
+                        {{ acc.nickname if acc.nickname else acc.steam_id }}
+                    </option>
+                    {% endfor %}
+                </select>
                 <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
                 <button class="btn" type="submit">搜索</button>
              </form>
@@ -2708,16 +3679,16 @@ ALL_INVENTORY_TEMPLATE = """
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
 
     <div class="toggle-bar" style="margin: 16px 0 20px 0;">
-        <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'all' else '' }}">全部</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=on_sale{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=on_sale{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'on_sale' else '' }}">在售中</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'tradable' else '' }}">可交易</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=not_tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=not_tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'not_tradable' else '' }}">不可交易</a>
     </div>
 
@@ -2792,7 +3763,21 @@ ALL_INVENTORY_TEMPLATE = """
                 </div>
 
                 <div class="num">¥ {{ "%.2f"|format(item.price) }}</div>
-                <div class="num">¥ {{ "%.2f"|format(item.purchase_price) }}</div>
+                <div>
+                    <div class="num">¥ {{ "%.2f"|format(item.purchase_price) }}</div>
+                    <form class="compact-price-form cost-save-form" method="post" action="/save_item_price" style="margin-top:8px;">
+                        <input type="hidden" name="steam_id" value="{{ item.steam_id }}">
+                        <input type="hidden" name="app_id" value="{{ item.app_id }}">
+                        <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                        <input type="hidden" name="return_all" value="1">
+                        <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
+                        <input type="hidden" name="q" value="{{ keyword }}">
+                        <input type="hidden" name="steam_id_filter" value="{{ selected_steam_id }}">
+                        <input class="compact-input" type="number" step="0.01" name="purchase_price"
+                               value="{{ "%.2f"|format(item.purchase_price) }}">
+                        <button class="save-btn" type="submit">保存成本价</button>
+                    </form>
+                </div>
 
                 <div class="{{ 'profit-plus' if item.profit >= 0 else 'profit-minus' }}">
                     ¥ {{ "%.2f"|format(item.profit) }}
@@ -2842,6 +3827,55 @@ ALL_INVENTORY_TEMPLATE = """
         <div class="empty">当前没有库存数据，请先同步所有账号库存</div>
     {% endif %}
 </div>
+<script>
+// 成本价改为异步保存，避免整页刷新导致先跳到顶部再回到当前位置。
+document.querySelectorAll(".cost-save-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const priceInput = form.querySelector('input[name="purchase_price"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "保存中...";
+        }
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "保存失败");
+            }
+
+            if (submitBtn) submitBtn.textContent = "已保存";
+            const panel = form.parentElement;
+            const priceBox = panel ? panel.querySelector(".num") : null;
+            const v = Number(priceInput ? priceInput.value : "0");
+            if (priceBox && !Number.isNaN(v)) {
+                priceBox.textContent = "¥ " + v.toFixed(2);
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "保存成本价";
+                }, 900);
+            }
+        }
+    });
+});
+</script>
 </body>
 </html>
 """
@@ -2996,6 +4030,8 @@ PROFIT_ANALYSIS_TEMPLATE = """
             </form>
 
             <a class="btn" href="/sync/profit_orders">同步利润订单</a>
+            <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page }}&refresh=1">刷新利润数据</a>
+            <a class="btn" href="/profit_debug?appId={{ app_id }}">利润诊断</a>
             <a class="btn" href="/">返回主页面</a>
         </div>
     </div>
@@ -3086,6 +4122,9 @@ PROFIT_ANALYSIS_TEMPLATE = """
 
                     <div>
                         <div class="subtext">assetId: {{ row.asset_id }}</div>
+                        {% if row.original_asset_id %}
+                        <div class="subtext">originalAssetId: {{ row.original_asset_id }}</div>
+                        {% endif %}
                         {% if row.style_id %}
                         <div class="subtext">styleId: {{ row.style_id }}</div>
                         {% endif %}
@@ -3243,13 +4282,17 @@ def accounts_page():
     error = request.args.get("error", "")
     steam_accounts = get_all_accounts_from_db()
     sync_status = get_sync_state()
+    failed_ids = load_failed_sync_ids()
+    last_sync_summary = load_inventory_sync_summary()
 
     return render_template_string(
         ACCOUNTS_TEMPLATE,
         msg=msg,
         error=error,
         steam_accounts=steam_accounts,
-        sync_status=sync_status
+        sync_status=sync_status,
+        failed_ids=failed_ids,
+        last_sync_summary=last_sync_summary
     )
 
 
@@ -3269,6 +4312,11 @@ def sync_accounts():
     if error:
         return redirect(url_for("accounts_page", error=f"同步账号失败：{error}"))
     return redirect(url_for("accounts_page", msg="所有账号同步成功"))
+
+
+@app.route("/sync/failed_ids")
+def sync_failed_ids_api():
+    return jsonify({"failed_ids": load_failed_sync_ids()})
 
 
 @app.route("/sync/all_inventory")
@@ -3381,6 +4429,7 @@ def sync_profit_orders():
                 return
 
             updated_count = reconcile_order_owners_by_asset(app_id=app_id, status="10")
+            clear_profit_analysis_cache()
 
             update_profit_sync_state(
                 running=False,
@@ -3412,25 +4461,55 @@ def profit_analysis_page():
     keyword = request.args.get("q", "").strip()
     selected_steam_id = request.args.get("steam_id", "").strip()
     page = request.args.get("page", "1")
+    refresh = request.args.get("refresh", "").strip() == "1"
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
+    from_cache = False
 
     accounts = get_all_accounts_from_db()
-    profit_rows, total_count, page, page_size = get_profit_rows_from_db(
-        app_id=app_id,
-        keyword=keyword,
-        steam_id=selected_steam_id,
-        page=page,
-        page_size=100
+    safe_page = max(int(page or 1), 1)
+    safe_page_size = 100
+    cache_obj = None if refresh else load_profit_analysis_cache(
+        app_id, keyword, selected_steam_id, safe_page, safe_page_size, max_age_seconds=None
     )
-    summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
-    daily_profit_chart = get_daily_profit_chart_data_from_db(
-        app_id=app_id,
-        keyword=keyword,
-        steam_id=selected_steam_id,
-        days=14
-    )
-    total_pages = max((total_count + page_size - 1) // page_size, 1)
+
+    if cache_obj and not profit_sync_status.get("running"):
+        profit_rows = cache_obj.get("profit_rows", []) or []
+        total_count = int(cache_obj.get("total_count", 0) or 0)
+        page = int(cache_obj.get("page", safe_page) or safe_page)
+        page_size = int(cache_obj.get("page_size", safe_page_size) or safe_page_size)
+        summary = cache_obj.get("summary", {}) or build_profit_summary(profit_rows)
+        daily_profit_chart = cache_obj.get("daily_profit_chart", []) or []
+        total_pages = int(cache_obj.get("total_pages", 1) or 1)
+        from_cache = True
+    else:
+        profit_rows, total_count, page, page_size = get_profit_rows_from_db(
+            app_id=app_id,
+            keyword=keyword,
+            steam_id=selected_steam_id,
+            page=safe_page,
+            page_size=safe_page_size
+        )
+        summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
+        daily_profit_chart = get_daily_profit_chart_data_from_db(
+            app_id=app_id,
+            keyword=keyword,
+            steam_id=selected_steam_id,
+            days=14
+        )
+        total_pages = max((total_count + page_size - 1) // page_size, 1)
+        save_profit_analysis_cache(
+            app_id, keyword, selected_steam_id, page, page_size,
+            {
+                "profit_rows": profit_rows,
+                "total_count": total_count,
+                "page": page,
+                "page_size": page_size,
+                "summary": summary,
+                "daily_profit_chart": daily_profit_chart,
+                "total_pages": total_pages,
+            }
+        )
 
     return render_template_string(
         PROFIT_ANALYSIS_TEMPLATE,
@@ -3445,10 +4524,104 @@ def profit_analysis_page():
         total_count=total_count,
         total_pages=total_pages,
         daily_profit_chart_json=json.dumps(daily_profit_chart, ensure_ascii=False),
-        msg=msg,
+        msg=(msg + ("（本页使用本地缓存加速）" if from_cache and not msg else ("本页使用本地缓存加速" if from_cache else ""))),
         error=error,
         profit_sync_status=profit_sync_status
     )
+
+
+@app.route("/profit_debug")
+def profit_debug_page():
+    app_id = request.args.get("appId", DEFAULT_APP_ID).strip() or DEFAULT_APP_ID
+    asset_id = request.args.get("asset_id", "").strip()
+    limit = request.args.get("limit", "100").strip()
+    msg = request.args.get("msg", "").strip()
+
+    try:
+        safe_limit = min(max(int(limit or 100), 1), 500)
+    except Exception:
+        safe_limit = 100
+
+    rows = []
+    if asset_id:
+        rows = get_profit_diagnostics_by_asset_id(asset_id=asset_id, app_id=app_id, limit=safe_limit)
+        if not rows:
+            msg = "未查到该 asset_id 的订单记录，或该记录暂无可用成本信息。"
+
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>利润诊断</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { margin:0; font-family: "Microsoft YaHei", Arial, sans-serif; background:#0b1220; color:#e5eefc; }
+        .container { max-width: 1800px; margin: 0 auto; padding: 24px; }
+        .toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
+        .input { padding:10px 12px; border-radius:10px; border:1px solid #2b3d59; background:#101a2b; color:#e5eefc; }
+        .btn { text-decoration:none; color:white; background:#2563eb; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; display:inline-block; }
+        .btn.gray { background:#475569; }
+        .msg { margin: 10px 0; padding: 12px; border-radius: 10px; background:#172554; color:#c7d2fe; }
+        .card { background:#111b2d; border:1px solid #27354a; border-radius:14px; padding:14px; margin-bottom:10px; }
+        .row { display:flex; flex-wrap:wrap; gap:10px 20px; }
+        .k { color:#8ca3c7; font-size:12px; }
+        .v { font-size:14px; font-weight:700; }
+        .ok { color:#86efac; }
+        .warn { color:#fca5a5; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2 style="margin-top:0;">利润诊断 / 调试输出</h2>
+    <div style="color:#8ca3c7; margin-bottom:14px;">输入 asset_id，查看每笔订单的卖出价、回溯账号、命中成本来源和利润计算过程。</div>
+
+    <form class="toolbar" method="get" action="/profit_debug">
+        <input class="input" type="text" name="appId" value="{{ app_id }}" placeholder="appId">
+        <input class="input" type="text" name="asset_id" value="{{ asset_id }}" placeholder="asset_id">
+        <input class="input" type="number" name="limit" min="1" max="500" value="{{ limit }}" placeholder="limit">
+        <button class="btn" type="submit">开始诊断</button>
+        <a class="btn gray" href="/profit_analysis?appId={{ app_id }}">返回利润分析</a>
+    </form>
+
+    {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+
+    {% if rows %}
+        <div style="margin-bottom:12px; color:#8ca3c7;">共 {{ rows|length }} 条结果（asset_id={{ asset_id }}）</div>
+        {% for r in rows %}
+        <div class="card">
+            <div class="row">
+                <div><div class="k">订单号</div><div class="v">{{ r.order_id }}</div></div>
+                <div><div class="k">时间</div><div class="v">{{ r.order_create_time_str }}</div></div>
+                <div><div class="k">订单状态</div><div class="v">{{ r.status_name }} ({{ r.order_status }})</div></div>
+                <div><div class="k">卖出价</div><div class="v">¥ {{ "%.2f"|format(r.order_price) }}</div></div>
+                <div><div class="k">利润</div><div class="v {{ 'ok' if r.profit >= 0 else 'warn' }}">¥ {{ "%.2f"|format(r.profit) }}</div></div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+                <div><div class="k">asset_id</div><div class="v">{{ r.asset_id }}</div></div>
+                <div><div class="k">original_asset_id</div><div class="v">{{ r.original_asset_id or '-' }}</div></div>
+                <div><div class="k">订单内 steam_id</div><div class="v">{{ r.order_steam_id or '-' }}</div></div>
+                <div><div class="k">归属历史 steam_id</div><div class="v">{{ r.owner_steam_id or '-' }}</div></div>
+                <div><div class="k">最终回溯 steam_id</div><div class="v">{{ r.resolved_steam_id or '-' }}</div></div>
+                <div><div class="k">回溯来源</div><div class="v">{{ r.resolve_source or '-' }}</div></div>
+                <div><div class="k">账号</div><div class="v">{{ r.nickname or '-' }} {% if r.username %}({{ r.username }}){% endif %}</div></div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+                <div><div class="k">单品成本</div><div class="v">¥ {{ "%.2f"|format(r.item_purchase_price) }}</div></div>
+                <div><div class="k">分组成本</div><div class="v">¥ {{ "%.2f"|format(r.group_purchase_price) }}</div></div>
+                <div><div class="k">库存成本</div><div class="v">¥ {{ "%.2f"|format(r.inventory_cost_price) }}</div></div>
+                <div><div class="k">命中成本来源</div><div class="v">{{ r.cost_source }}</div></div>
+                <div><div class="k">命中成本价</div><div class="v">¥ {{ "%.2f"|format(r.hit_cost) }}</div></div>
+            </div>
+        </div>
+        {% endfor %}
+    {% elif asset_id %}
+        <div class="msg">没有查到可展示的数据。</div>
+    {% endif %}
+</div>
+</body>
+</html>
+    """, app_id=app_id, asset_id=asset_id, limit=safe_limit, rows=rows, msg=msg)
 
 
 @app.route("/inventory/<steam_id>")
@@ -3549,11 +4722,32 @@ def save_item_price_route():
     asset_id = request.form.get("asset_id", "").strip()
     purchase_price = request.form.get("purchase_price", "0").strip()
     return_name = request.form.get("return_name", "").strip()
+    return_all = request.form.get("return_all", "").strip()
+    inventory_filter = request.form.get("inventory_filter", "all").strip()
+    keyword = request.form.get("q", "").strip()
+    steam_id_filter = request.form.get("steam_id_filter", "").strip()
+
+    is_ajax = request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest"
 
     if not steam_id or not asset_id:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "保存单品成本价失败：缺少必要参数"}), 400
         return redirect(url_for("accounts_page", error="保存单品成本价失败：缺少必要参数"))
 
     save_item_purchase_price(steam_id, app_id, asset_id, purchase_price)
+
+    if is_ajax:
+        return jsonify({"ok": True, "msg": "单品购入成本价保存成功"})
+
+    if return_all:
+        return redirect(url_for(
+            "all_inventory_page",
+            appId=app_id,
+            inventory_filter=inventory_filter,
+            q=keyword,
+            steam_id=steam_id_filter,
+            msg="单品购入成本价保存成功"
+        ))
 
     if return_name:
         return redirect(url_for(
@@ -3680,6 +4874,7 @@ def sell_item_route():
 def all_inventory_page():
     app_id = request.args.get("appId", DEFAULT_APP_ID)
     keyword = request.args.get("q", "").strip().lower()
+    selected_steam_id = request.args.get("steam_id", "").strip()
     inventory_filter = request.args.get("inventory_filter", "all").strip()
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
@@ -3687,7 +4882,7 @@ def all_inventory_page():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
+    sql = """
     SELECT
         i.steam_id,
         i.app_id,
@@ -3705,7 +4900,7 @@ def all_inventory_page():
         i.style_id,
         i.weapon_name,
         i.exterior_name,
-        COALESCE(p.purchase_price, 0) AS purchase_price,
+        COALESCE(p.purchase_price, i.cost_price, 0) AS purchase_price,
         a.nickname,
         a.username
     FROM inventory_items i
@@ -3717,8 +4912,13 @@ def all_inventory_page():
     LEFT JOIN steam_accounts a
       ON i.steam_id = a.steam_id
     WHERE i.app_id = ?
-    ORDER BY i.price DESC, i.name ASC
-    """, (app_id,))
+    """
+    params = [app_id]
+    if selected_steam_id:
+        sql += " AND i.steam_id = ?"
+        params.append(selected_steam_id)
+    sql += " ORDER BY i.price DESC, i.name ASC"
+    cur.execute(sql, params)
 
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -3755,6 +4955,7 @@ def all_inventory_page():
     tradable_count = sum(1 for x in items if x["bucket"] == "tradable")
     total_market_value = sum(safe_float(x["price"], 0) for x in items)
     total_cost = sum(safe_float(x["purchase_price"], 0) for x in items)
+    accounts = get_all_accounts_from_db()
 
     return render_template_string(
         ALL_INVENTORY_TEMPLATE,
@@ -3765,6 +4966,8 @@ def all_inventory_page():
         total_market_value=total_market_value,
         total_cost=total_cost,
         keyword=keyword,
+        selected_steam_id=selected_steam_id,
+        accounts=accounts,
         inventory_filter=inventory_filter,
         msg=msg,
         error=error
