@@ -3578,8 +3578,20 @@ ALL_INVENTORY_TEMPLATE = """
             cursor: pointer;
             font-size: 13px;
         }
+        .save-btn {
+            padding: 10px 12px;
+            border: 0;
+            border-radius: 10px;
+            background: #0f9d58;
+            color: white;
+            cursor: pointer;
+            font-size: 13px;
+        }
         .sell-btn:hover {
             background: #b45309;
+        }
+        .save-btn:hover {
+            background: #0c7e47;
         }
 
         @media (max-width: 1350px) {
@@ -3703,7 +3715,21 @@ ALL_INVENTORY_TEMPLATE = """
                 </div>
 
                 <div class="num">¥ {{ "%.2f"|format(item.price) }}</div>
-                <div class="num">¥ {{ "%.2f"|format(item.purchase_price) }}</div>
+                <div>
+                    <div class="num">¥ {{ "%.2f"|format(item.purchase_price) }}</div>
+                    <form class="compact-price-form" method="post" action="/save_item_price" style="margin-top:8px;">
+                        <input type="hidden" name="steam_id" value="{{ item.steam_id }}">
+                        <input type="hidden" name="app_id" value="{{ item.app_id }}">
+                        <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
+                        <input type="hidden" name="return_all" value="1">
+                        <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
+                        <input type="hidden" name="q" value="{{ keyword }}">
+                        <input type="hidden" name="steam_id_filter" value="{{ selected_steam_id }}">
+                        <input class="compact-input" type="number" step="0.01" name="purchase_price"
+                               value="{{ "%.2f"|format(item.purchase_price) }}">
+                        <button class="save-btn" type="submit">保存成本价</button>
+                    </form>
+                </div>
 
                 <div class="{{ 'profit-plus' if item.profit >= 0 else 'profit-minus' }}">
                     ¥ {{ "%.2f"|format(item.profit) }}
@@ -4599,11 +4625,25 @@ def save_item_price_route():
     asset_id = request.form.get("asset_id", "").strip()
     purchase_price = request.form.get("purchase_price", "0").strip()
     return_name = request.form.get("return_name", "").strip()
+    return_all = request.form.get("return_all", "").strip()
+    inventory_filter = request.form.get("inventory_filter", "all").strip()
+    keyword = request.form.get("q", "").strip()
+    steam_id_filter = request.form.get("steam_id_filter", "").strip()
 
     if not steam_id or not asset_id:
         return redirect(url_for("accounts_page", error="保存单品成本价失败：缺少必要参数"))
 
     save_item_purchase_price(steam_id, app_id, asset_id, purchase_price)
+
+    if return_all:
+        return redirect(url_for(
+            "all_inventory_page",
+            appId=app_id,
+            inventory_filter=inventory_filter,
+            q=keyword,
+            steam_id=steam_id_filter,
+            msg="单品购入成本价保存成功"
+        ))
 
     if return_name:
         return redirect(url_for(
