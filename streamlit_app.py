@@ -2799,8 +2799,10 @@ ACCOUNTS_TEMPLATE = """
         <div class="grid">
             {% for item in steam_accounts %}
             <div class="card account-card"
+                 id="account-card-{{ item.steam_id }}"
+                 data-steam-id="{{ item.steam_id }}"
                  data-search="{{ (item.nickname ~ ' ' ~ item.username ~ ' ' ~ item.steam_id)|lower }}"
-                 onclick="window.location='/inventory/{{ item.steam_id }}'">
+                 onclick="handleOpenInventory('{{ item.steam_id }}')">
                 <div class="row-top">
                     <img class="avatar" src="{{ item.avatar }}" alt="avatar"
                          onerror="this.onerror=null;this.src='https://via.placeholder.com/76?text=No+Img'">
@@ -2830,6 +2832,29 @@ ACCOUNTS_TEMPLATE = """
 const input = document.getElementById("searchInput");
 const cards = document.querySelectorAll(".account-card");
 const emptyState = document.getElementById("emptyState");
+const LAST_VIEWED_STEAM_KEY = "accounts_last_viewed_steam_id";
+
+function handleOpenInventory(steamId) {
+    try {
+        if (steamId) sessionStorage.setItem(LAST_VIEWED_STEAM_KEY, String(steamId));
+    } catch (e) {
+        console.log("save last steam id failed", e);
+    }
+    window.location = `/inventory/${steamId}`;
+}
+
+function restoreLastViewedCardPosition() {
+    try {
+        const steamId = sessionStorage.getItem(LAST_VIEWED_STEAM_KEY);
+        if (!steamId) return;
+        const target = document.getElementById(`account-card-${steamId}`);
+        if (!target) return;
+        target.scrollIntoView({ behavior: "auto", block: "center" });
+        sessionStorage.removeItem(LAST_VIEWED_STEAM_KEY);
+    } catch (e) {
+        console.log("restore card position failed", e);
+    }
+}
 
 if (input) {
     input.addEventListener("input", function () {
@@ -2844,6 +2869,8 @@ if (input) {
         if (emptyState) emptyState.style.display = visibleCount === 0 ? "block" : "none";
     });
 }
+
+restoreLastViewedCardPosition();
 
 async function refreshSyncStatus() {
     try {
