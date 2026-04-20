@@ -32,6 +32,7 @@ DB_PATH = "steam_inventory_app.db"
 FAILED_SYNC_FILE = "failed_inventory_sync.json"
 IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cached_images")
 INVENTORY_SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "inventory_snapshots")
+PROFIT_ANALYSIS_CACHE_DIR = os.path.join(os.path.dirname(__file__), "profit_analysis_cache")
 
 
 # =========================
@@ -491,6 +492,55 @@ def list_inventory_snapshot_files():
         return [os.path.join(INVENTORY_SNAPSHOT_DIR, x) for x in os.listdir(INVENTORY_SNAPSHOT_DIR) if x.endswith(".json")]
     except Exception:
         return []
+
+
+def ensure_profit_analysis_cache_dir():
+    try:
+        os.makedirs(PROFIT_ANALYSIS_CACHE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size):
+    ensure_profit_analysis_cache_dir()
+    raw = f"{app_id}|{keyword}|{steam_id}|{page}|{page_size}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return os.path.join(PROFIT_ANALYSIS_CACHE_DIR, f"{digest}.json")
+
+
+def load_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, max_age_seconds=30):
+    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = float(data.get("cached_at_ts", 0) or 0)
+        if ts <= 0 or (time.time() - ts) > max_age_seconds:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def save_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, payload):
+    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size)
+    body = {
+        "cached_at_ts": time.time(),
+        "cached_at": now_str(),
+        "app_id": str(app_id or ""),
+        "keyword": keyword or "",
+        "steam_id": steam_id or "",
+        "page": int(page or 1),
+        "page_size": int(page_size or 100),
+    }
+    if isinstance(payload, dict):
+        body.update(payload)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[利润缓存写入失败] {path}: {e}")
 
 
 def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
@@ -1951,6 +2001,10 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     conn.close()
 
     result = []
+    resolved_cache = {}
+    item_cost_cache = {}
+    inv_cost_cache = {}
+    account_cache = {}
 
     for row in rows:
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
@@ -1960,11 +2014,17 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         item_name = str(row.get("name", "") or "")
 
         if not resolved_steam_id and asset_id:
-            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
+            k = (row_app_id, asset_id, original_asset_id)
+            if k not in resolved_cache:
+                resolved_cache[k] = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
+            resolved_steam_id, _ = resolved_cache[k]
 
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         if item_cost <= 0 and asset_id:
-            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in item_cost_cache:
+                item_cost_cache[k] = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            item_cost = item_cost_cache[k]
 
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
         if group_cost <= 0 and resolved_steam_id and item_name:
@@ -1972,7 +2032,10 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
 
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
         if inventory_cost <= 0 and asset_id:
-            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in inv_cost_cache:
+                inv_cost_cache[k] = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            inventory_cost = inv_cost_cache[k]
         cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
 
         order_price = safe_float(row.get("order_price", 0), 0)
@@ -1982,7 +2045,9 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         nickname = row.get("nickname", "")
         username = row.get("username", "")
         if resolved_steam_id and (not nickname and not username):
-            nickname, username = lookup_account_name(resolved_steam_id)
+            if resolved_steam_id not in account_cache:
+                account_cache[resolved_steam_id] = lookup_account_name(resolved_steam_id)
+            nickname, username = account_cache[resolved_steam_id]
 
         record = {
             "order_id": str(row.get("order_id", "") or ""),
@@ -2105,6 +2170,9 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     conn.close()
 
     daily = defaultdict(float)
+    resolved_cache = {}
+    item_cost_cache = {}
+    inv_cost_cache = {}
     for row in rows:
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
         asset_id = str(row.get("asset_id", "") or "").strip()
@@ -2113,11 +2181,17 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         item_name = str(row.get("name", "") or "")
 
         if not resolved_steam_id and asset_id:
-            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
+            k = (row_app_id, asset_id, original_asset_id)
+            if k not in resolved_cache:
+                resolved_cache[k] = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
+            resolved_steam_id, _ = resolved_cache[k]
 
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         if item_cost <= 0 and asset_id:
-            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in item_cost_cache:
+                item_cost_cache[k] = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            item_cost = item_cost_cache[k]
 
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
         if group_cost <= 0 and resolved_steam_id and item_name:
@@ -2125,7 +2199,10 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
 
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
         if inventory_cost <= 0 and asset_id:
-            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            k = (row_app_id, asset_id, original_asset_id, resolved_steam_id)
+            if k not in inv_cost_cache:
+                inv_cost_cache[k] = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
+            inventory_cost = inv_cost_cache[k]
         cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
         if cost_price <= 0:
             continue
@@ -2199,6 +2276,10 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
     conn.close()
 
     result = []
+    resolved_cache = {}
+    item_cost_cache = {}
+    inv_cost_cache = {}
+    account_cache = {}
     for row in rows:
         row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         row_asset_id = str(row.get("asset_id", "") or "").strip()
@@ -2208,11 +2289,17 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
         resolve_source = "order_or_history"
 
         if not resolved_steam_id and row_asset_id:
-            resolved_steam_id, resolve_source = lookup_resolved_steam_id_by_asset(row_app_id, row_asset_id, row_original_asset_id)
+            k = (row_app_id, row_asset_id, row_original_asset_id)
+            if k not in resolved_cache:
+                resolved_cache[k] = lookup_resolved_steam_id_by_asset(row_app_id, row_asset_id, row_original_asset_id)
+            resolved_steam_id, resolve_source = resolved_cache[k]
 
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         if item_cost <= 0 and row_asset_id:
-            item_cost = lookup_item_purchase_price_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
+            k = (row_app_id, row_asset_id, row_original_asset_id, resolved_steam_id)
+            if k not in item_cost_cache:
+                item_cost_cache[k] = lookup_item_purchase_price_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
+            item_cost = item_cost_cache[k]
 
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
         if group_cost <= 0 and resolved_steam_id and row_name:
@@ -2220,7 +2307,10 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
 
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
         if inventory_cost <= 0 and row_asset_id:
-            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
+            k = (row_app_id, row_asset_id, row_original_asset_id, resolved_steam_id)
+            if k not in inv_cost_cache:
+                inv_cost_cache[k] = lookup_inventory_cost_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
+            inventory_cost = inv_cost_cache[k]
 
         if item_cost > 0:
             cost_source = "单品成本(item_purchase_prices)"
@@ -2241,7 +2331,9 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
         nickname = row.get("nickname", "")
         username = row.get("username", "")
         if resolved_steam_id and (not nickname and not username):
-            nickname, username = lookup_account_name(resolved_steam_id)
+            if resolved_steam_id not in account_cache:
+                account_cache[resolved_steam_id] = lookup_account_name(resolved_steam_id)
+            nickname, username = account_cache[resolved_steam_id]
 
         result.append({
             "order_id": str(row.get("order_id", "") or ""),
@@ -3788,6 +3880,9 @@ PROFIT_ANALYSIS_TEMPLATE = """
 
                     <div>
                         <div class="subtext">assetId: {{ row.asset_id }}</div>
+                        {% if row.original_asset_id %}
+                        <div class="subtext">originalAssetId: {{ row.original_asset_id }}</div>
+                        {% endif %}
                         {% if row.style_id %}
                         <div class="subtext">styleId: {{ row.style_id }}</div>
                         {% endif %}
@@ -4116,23 +4211,50 @@ def profit_analysis_page():
     page = request.args.get("page", "1")
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
+    from_cache = False
 
     accounts = get_all_accounts_from_db()
-    profit_rows, total_count, page, page_size = get_profit_rows_from_db(
-        app_id=app_id,
-        keyword=keyword,
-        steam_id=selected_steam_id,
-        page=page,
-        page_size=100
-    )
-    summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
-    daily_profit_chart = get_daily_profit_chart_data_from_db(
-        app_id=app_id,
-        keyword=keyword,
-        steam_id=selected_steam_id,
-        days=14
-    )
-    total_pages = max((total_count + page_size - 1) // page_size, 1)
+    safe_page = max(int(page or 1), 1)
+    safe_page_size = 100
+    cache_obj = load_profit_analysis_cache(app_id, keyword, selected_steam_id, safe_page, safe_page_size, max_age_seconds=20)
+
+    if cache_obj and not profit_sync_status.get("running"):
+        profit_rows = cache_obj.get("profit_rows", []) or []
+        total_count = int(cache_obj.get("total_count", 0) or 0)
+        page = int(cache_obj.get("page", safe_page) or safe_page)
+        page_size = int(cache_obj.get("page_size", safe_page_size) or safe_page_size)
+        summary = cache_obj.get("summary", {}) or build_profit_summary(profit_rows)
+        daily_profit_chart = cache_obj.get("daily_profit_chart", []) or []
+        total_pages = int(cache_obj.get("total_pages", 1) or 1)
+        from_cache = True
+    else:
+        profit_rows, total_count, page, page_size = get_profit_rows_from_db(
+            app_id=app_id,
+            keyword=keyword,
+            steam_id=selected_steam_id,
+            page=safe_page,
+            page_size=safe_page_size
+        )
+        summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
+        daily_profit_chart = get_daily_profit_chart_data_from_db(
+            app_id=app_id,
+            keyword=keyword,
+            steam_id=selected_steam_id,
+            days=14
+        )
+        total_pages = max((total_count + page_size - 1) // page_size, 1)
+        save_profit_analysis_cache(
+            app_id, keyword, selected_steam_id, page, page_size,
+            {
+                "profit_rows": profit_rows,
+                "total_count": total_count,
+                "page": page,
+                "page_size": page_size,
+                "summary": summary,
+                "daily_profit_chart": daily_profit_chart,
+                "total_pages": total_pages,
+            }
+        )
 
     return render_template_string(
         PROFIT_ANALYSIS_TEMPLATE,
@@ -4147,7 +4269,7 @@ def profit_analysis_page():
         total_count=total_count,
         total_pages=total_pages,
         daily_profit_chart_json=json.dumps(daily_profit_chart, ensure_ascii=False),
-        msg=msg,
+        msg=(msg + ("（本页使用本地缓存加速）" if from_cache and not msg else ("本页使用本地缓存加速" if from_cache else ""))),
         error=error,
         profit_sync_status=profit_sync_status
     )
