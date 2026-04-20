@@ -31,6 +31,7 @@ DEFAULT_APP_ID = "730"
 DB_PATH = "steam_inventory_app.db"
 FAILED_SYNC_FILE = "failed_inventory_sync.json"
 IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cached_images")
+INVENTORY_SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "inventory_snapshots")
 
 
 # =========================
@@ -437,6 +438,153 @@ def bool_to_int(v):
     return 1 if v else 0
 
 
+def ensure_inventory_snapshot_dir():
+    try:
+        os.makedirs(INVENTORY_SNAPSHOT_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def get_inventory_snapshot_path(steam_id, app_id):
+    safe_steam = str(steam_id or "").strip()
+    safe_app = str(app_id or "").strip()
+    return os.path.join(INVENTORY_SNAPSHOT_DIR, f"{safe_steam}_{safe_app}.json")
+
+
+def load_inventory_snapshot(steam_id, app_id):
+    ensure_inventory_snapshot_dir()
+    path = get_inventory_snapshot_path(steam_id, app_id)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_inventory_snapshot(steam_id, app_id, snapshot):
+    ensure_inventory_snapshot_dir()
+    path = get_inventory_snapshot_path(steam_id, app_id)
+    payload = snapshot if isinstance(snapshot, dict) else {}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[快照写入失败] {path}: {e}")
+
+
+def list_inventory_snapshot_files():
+    ensure_inventory_snapshot_dir()
+    try:
+        return [os.path.join(INVENTORY_SNAPSHOT_DIR, x) for x in os.listdir(INVENTORY_SNAPSHOT_DIR) if x.endswith(".json")]
+    except Exception:
+        return []
+
+
+def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
+    item_info = item.get("itemInfo", {}) or {}
+    asset_info = item.get("assetInfo", {}) or {}
+    asset_id = str(item.get("assetId", "") or "").strip()
+    if not asset_id:
+        return None
+
+    cost_price = safe_float(
+        item.get("purchasePrice",
+                 item.get("costPrice",
+                          item.get("cost",
+                                   item.get("buyPrice", 0)))),
+        0
+    )
+    if cost_price <= 0 and isinstance(existing_entry, dict):
+        cost_price = safe_float(existing_entry.get("cost_price", 0), 0)
+
+    return {
+        "steam_id": str(steam_id or "").strip(),
+        "app_id": str(app_id or "").strip(),
+        "asset_id": asset_id,
+        "name": item.get("name", ""),
+        "short_name": item.get("shortName", ""),
+        "price": safe_float(item.get("price", 0), 0),
+        "cost_price": cost_price,
+        "status": int(item.get("status", 0) or 0),
+        "if_tradable": bool_to_int(item.get("ifTradable", False)),
+        "style_id": str(asset_info.get("styleId", "") or ""),
+        "wear": str(asset_info.get("wear", "") or ""),
+        "weapon_name": item_info.get("weaponName", ""),
+        "exterior_name": item_info.get("exteriorName", ""),
+        "updated_at": now_str(),
+    }
+
+
+def update_inventory_snapshot_from_raw_items(steam_id, app_id, raw_items):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    if not steam_id or not app_id:
+        return
+
+    snapshot = load_inventory_snapshot(steam_id, app_id)
+    new_snapshot = {}
+    for item in (raw_items or []):
+        asset_id = str(item.get("assetId", "") or "").strip()
+        if not asset_id:
+            continue
+        entry = build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=snapshot.get(asset_id))
+        if entry:
+            new_snapshot[asset_id] = entry
+
+    save_inventory_snapshot(steam_id, app_id, new_snapshot)
+
+
+def update_inventory_snapshot_cost(steam_id, app_id, asset_id, cost_price):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    asset_id = str(asset_id or "").strip()
+    if not steam_id or not app_id or not asset_id:
+        return
+
+    snapshot = load_inventory_snapshot(steam_id, app_id)
+    entry = snapshot.get(asset_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["steam_id"] = steam_id
+    entry["app_id"] = app_id
+    entry["asset_id"] = asset_id
+    entry["cost_price"] = safe_float(cost_price, 0)
+    entry["updated_at"] = now_str()
+    snapshot[asset_id] = entry
+    save_inventory_snapshot(steam_id, app_id, snapshot)
+
+
+def find_asset_in_snapshots(asset_id, app_id=None):
+    asset_id = str(asset_id or "").strip()
+    app_id = str(app_id or "").strip() if app_id is not None else ""
+    if not asset_id:
+        return []
+
+    hits = []
+    for path in list_inventory_snapshot_files():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            entry = data.get(asset_id)
+            if not isinstance(entry, dict):
+                continue
+            entry_app_id = str(entry.get("app_id", "") or "").strip()
+            if app_id and entry_app_id and entry_app_id != app_id:
+                continue
+            hits.append(entry)
+        except Exception:
+            continue
+    hits.sort(key=lambda x: str(x.get("updated_at", "") or ""), reverse=True)
+    return hits
+
+
 def ensure_image_cache_dir():
     os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
 
@@ -829,6 +977,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
             conn.commit()
             conn.close()
+            save_inventory_snapshot(steam_id, app_id, {})
 
             return "empty"   # 特殊状态：库存为空，但同步成功
         return error
@@ -936,6 +1085,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
     conn.commit()
     conn.close()
+    update_inventory_snapshot_from_raw_items(steam_id, app_id, raw_items)
     return None
 
 
@@ -1011,7 +1161,14 @@ def lookup_resolved_steam_id_by_asset(app_id, asset_id):
     if row and str(row["steam_id"] or "").strip():
         return str(row["steam_id"]).strip(), "item_purchase_prices"
 
-    # 4) 兜底：忽略 app_id，全库按 asset_id 搜（兼容历史脏数据 app_id 缺失/不一致）
+    # 4) 快照兜底（每个 steam_id + app_id 的库存记忆文件）
+    snapshot_hits = find_asset_in_snapshots(asset_id, app_id=app_id)
+    if snapshot_hits:
+        steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
+        if steam:
+            return steam, "snapshot(app)"
+
+    # 5) 兜底：忽略 app_id，全库按 asset_id 搜（兼容历史脏数据 app_id 缺失/不一致）
     cur = get_conn().cursor()
     cur.execute("""
     SELECT steam_id
@@ -1048,6 +1205,12 @@ def lookup_resolved_steam_id_by_asset(app_id, asset_id):
     cur.connection.close()
     if row and str(row["steam_id"] or "").strip():
         return str(row["steam_id"]).strip(), "item_purchase_prices(global)"
+
+    snapshot_hits = find_asset_in_snapshots(asset_id, app_id=None)
+    if snapshot_hits:
+        steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
+        if steam:
+            return steam, "snapshot(global)"
 
     return "", "none"
 
@@ -1110,6 +1273,13 @@ def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id=""):
     row = cur.fetchone()
     conn.close()
     if not row:
+        snapshot_hits = find_asset_in_snapshots(asset_id, app_id=app_id if app_id else None)
+        if steam_id:
+            for hit in snapshot_hits:
+                if str(hit.get("steam_id", "") or "").strip() == steam_id:
+                    return safe_float(hit.get("cost_price", 0), 0)
+        if snapshot_hits:
+            return safe_float(snapshot_hits[0].get("cost_price", 0), 0)
         return 0.0
     return safe_float(row["purchase_price"], 0)
 
@@ -1172,6 +1342,13 @@ def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id=""):
     row = cur.fetchone()
     conn.close()
     if not row:
+        snapshot_hits = find_asset_in_snapshots(asset_id, app_id=app_id if app_id else None)
+        if steam_id:
+            for hit in snapshot_hits:
+                if str(hit.get("steam_id", "") or "").strip() == steam_id:
+                    return safe_float(hit.get("cost_price", 0), 0)
+        if snapshot_hits:
+            return safe_float(snapshot_hits[0].get("cost_price", 0), 0)
         return 0.0
     return safe_float(row["cost_price"], 0)
 
@@ -1478,6 +1655,7 @@ def save_item_purchase_price(steam_id, app_id, asset_id, purchase_price):
     """, (normalized_price, current_time, steam_id, app_id, asset_id))
     conn.commit()
     conn.close()
+    update_inventory_snapshot_cost(steam_id, app_id, asset_id, normalized_price)
 
 
 def apply_group_price_to_items(steam_id, app_id, group_name, price):
@@ -1514,6 +1692,10 @@ def apply_group_price_to_items(steam_id, app_id, group_name, price):
 
     conn.commit()
     conn.close()
+    for row in rows:
+        aid = str(row["asset_id"] or "").strip()
+        if aid:
+            update_inventory_snapshot_cost(steam_id, app_id, aid, normalized_price)
 
 
 def group_inventory_by_name(items, steam_id, app_id):
