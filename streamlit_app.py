@@ -2507,6 +2507,9 @@ ACCOUNTS_TEMPLATE = """
         .progress-bar { width:100%; height:14px; background:#0f1727; border-radius:999px; overflow:hidden; border:1px solid #30465f; }
         .progress-inner { height:100%; background:#2563eb; width:0%; transition:width .2s ease; }
         .sync-note { margin-top: 10px; color:#8ca3c7; font-size:13px; line-height:1.5; }
+        .failed-box { margin-top: 12px; padding: 10px 12px; border-radius: 12px; border:1px solid rgba(212,68,68,0.4); background: rgba(74,19,24,0.35); }
+        .failed-title { color:#ffd6d6; font-size:13px; margin-bottom:6px; font-weight:700; }
+        .failed-list { color:#ffd6d6; font-size:12px; line-height:1.5; word-break:break-all; max-height:90px; overflow:auto; }
     </style>
 </head>
 <body>
@@ -2586,6 +2589,16 @@ ACCOUNTS_TEMPLATE = """
             {% else %}
                 暂无失败信息
             {% endif %}
+        </div>
+        <div class="failed-box">
+            <div class="failed-title">当前失败账号（待重试）</div>
+            <div id="failedIdsList" class="failed-list">
+                {% if failed_ids %}
+                    {{ failed_ids|join(' / ') }}
+                {% else %}
+                    暂无失败账号
+                {% endif %}
+            </div>
         </div>
     </div>
 
@@ -2690,6 +2703,16 @@ async function refreshSyncStatus() {
             const finished = Number(data.finished || 0);
             const percent = total > 0 ? Math.min(100, (finished * 100 / total)) : 0;
             progressBar.style.width = percent + '%';
+        }
+
+        const failedNode = document.getElementById('failedIdsList');
+        if (failedNode) {
+            const failedResp = await fetch('/sync/failed_ids', { cache: 'no-store' });
+            if (failedResp.ok) {
+                const failedData = await failedResp.json();
+                const ids = failedData.failed_ids || [];
+                failedNode.textContent = ids.length ? ids.join(' / ') : '暂无失败账号';
+            }
         }
     } catch (e) {
         console.log('refresh sync status failed', e);
@@ -3489,6 +3512,14 @@ ALL_INVENTORY_TEMPLATE = """
         <div class="toolbar">
              <form method="get" action="/all_inventory" style="display:flex; gap:10px; flex-wrap:wrap;">
                 <input class="input" type="text" name="q" value="{{ keyword }}" placeholder="搜索 名称 / assetId / styleId / SteamID / 昵称">
+                <select class="select-input" name="steam_id" style="width:240px;">
+                    <option value="">全部账号</option>
+                    {% for acc in accounts %}
+                    <option value="{{ acc.steam_id }}" {{ 'selected' if selected_steam_id == acc.steam_id else '' }}>
+                        {{ acc.nickname if acc.nickname else acc.steam_id }}
+                    </option>
+                    {% endfor %}
+                </select>
                 <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
                 <button class="btn" type="submit">搜索</button>
              </form>
@@ -3501,16 +3532,16 @@ ALL_INVENTORY_TEMPLATE = """
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
 
     <div class="toggle-bar" style="margin: 16px 0 20px 0;">
-        <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'all' else '' }}">全部</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=on_sale{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=on_sale{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'on_sale' else '' }}">在售中</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'tradable' else '' }}">可交易</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=not_tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=not_tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'not_tradable' else '' }}">不可交易</a>
     </div>
 
@@ -4040,13 +4071,15 @@ def accounts_page():
     error = request.args.get("error", "")
     steam_accounts = get_all_accounts_from_db()
     sync_status = get_sync_state()
+    failed_ids = load_failed_sync_ids()
 
     return render_template_string(
         ACCOUNTS_TEMPLATE,
         msg=msg,
         error=error,
         steam_accounts=steam_accounts,
-        sync_status=sync_status
+        sync_status=sync_status,
+        failed_ids=failed_ids
     )
 
 
@@ -4066,6 +4099,11 @@ def sync_accounts():
     if error:
         return redirect(url_for("accounts_page", error=f"同步账号失败：{error}"))
     return redirect(url_for("accounts_page", msg="所有账号同步成功"))
+
+
+@app.route("/sync/failed_ids")
+def sync_failed_ids_api():
+    return jsonify({"failed_ids": load_failed_sync_ids()})
 
 
 @app.route("/sync/all_inventory")
@@ -4598,6 +4636,7 @@ def sell_item_route():
 def all_inventory_page():
     app_id = request.args.get("appId", DEFAULT_APP_ID)
     keyword = request.args.get("q", "").strip().lower()
+    selected_steam_id = request.args.get("steam_id", "").strip()
     inventory_filter = request.args.get("inventory_filter", "all").strip()
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
@@ -4605,7 +4644,7 @@ def all_inventory_page():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
+    sql = """
     SELECT
         i.steam_id,
         i.app_id,
@@ -4635,8 +4674,13 @@ def all_inventory_page():
     LEFT JOIN steam_accounts a
       ON i.steam_id = a.steam_id
     WHERE i.app_id = ?
-    ORDER BY i.price DESC, i.name ASC
-    """, (app_id,))
+    """
+    params = [app_id]
+    if selected_steam_id:
+        sql += " AND i.steam_id = ?"
+        params.append(selected_steam_id)
+    sql += " ORDER BY i.price DESC, i.name ASC"
+    cur.execute(sql, params)
 
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -4673,6 +4717,7 @@ def all_inventory_page():
     tradable_count = sum(1 for x in items if x["bucket"] == "tradable")
     total_market_value = sum(safe_float(x["price"], 0) for x in items)
     total_cost = sum(safe_float(x["purchase_price"], 0) for x in items)
+    accounts = get_all_accounts_from_db()
 
     return render_template_string(
         ALL_INVENTORY_TEMPLATE,
@@ -4683,6 +4728,8 @@ def all_inventory_page():
         total_market_value=total_market_value,
         total_cost=total_cost,
         keyword=keyword,
+        selected_steam_id=selected_steam_id,
+        accounts=accounts,
         inventory_filter=inventory_filter,
         msg=msg,
         error=error
