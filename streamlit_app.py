@@ -3465,38 +3465,52 @@ function applyFilters() {
 
 if (searchInput) searchInput.addEventListener("input", applyFilters);
 
-// 保存成本价前记录滚动位置，返回后恢复，避免页面回到顶部。
-const COST_SCROLL_KEY = "inventory_scroll_y";
+// 成本价改为异步保存，避免整页刷新导致先跳到顶部再回到当前位置。
 document.querySelectorAll(".cost-save-form").forEach(form => {
-    form.addEventListener("submit", () => {
-        try {
-            sessionStorage.setItem(COST_SCROLL_KEY, String(window.scrollY || 0));
-        } catch (e) {}
-    });
-});
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
 
-window.addEventListener("load", () => {
-    try {
-        const rawY = sessionStorage.getItem(COST_SCROLL_KEY);
-        if (rawY === null) return;
-        const y = Number(rawY || 0);
-        if (Number.isNaN(y)) {
-            sessionStorage.removeItem(COST_SCROLL_KEY);
-            return;
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const priceInput = form.querySelector('input[name="purchase_price"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "保存中...";
         }
-        let attempts = 0;
-        const maxAttempts = 10;
-        const restore = () => {
-            window.scrollTo(0, y);
-            attempts += 1;
-            if (attempts < maxAttempts) {
-                setTimeout(restore, 60);
-            } else {
-                sessionStorage.removeItem(COST_SCROLL_KEY);
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "保存失败");
             }
-        };
-        restore();
-    } catch (e) {}
+
+            if (submitBtn) submitBtn.textContent = "已保存";
+            const card = form.closest(".detail-row");
+            const priceBox = card ? card.querySelector(".num-box") : null;
+            const v = Number(priceInput ? priceInput.value : "0");
+            if (priceBox && !Number.isNaN(v)) {
+                priceBox.textContent = "¥ " + v.toFixed(2);
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "保存成本价";
+                }, 900);
+            }
+        }
+    });
 });
 </script>
 </body>
@@ -3814,38 +3828,52 @@ ALL_INVENTORY_TEMPLATE = """
     {% endif %}
 </div>
 <script>
-// 保存成本价前记录滚动位置，返回后恢复，避免页面回到顶部。
-const COST_SCROLL_KEY = "all_inventory_scroll_y";
-document.querySelectorAll('.cost-save-form').forEach(form => {
-    form.addEventListener('submit', () => {
-        try {
-            sessionStorage.setItem(COST_SCROLL_KEY, String(window.scrollY || 0));
-        } catch (e) {}
-    });
-});
+// 成本价改为异步保存，避免整页刷新导致先跳到顶部再回到当前位置。
+document.querySelectorAll(".cost-save-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
 
-window.addEventListener("load", () => {
-    try {
-        const rawY = sessionStorage.getItem(COST_SCROLL_KEY);
-        if (rawY === null) return;
-        const y = Number(rawY || 0);
-        if (Number.isNaN(y)) {
-            sessionStorage.removeItem(COST_SCROLL_KEY);
-            return;
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const priceInput = form.querySelector('input[name="purchase_price"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "保存中...";
         }
-        let attempts = 0;
-        const maxAttempts = 10;
-        const restore = () => {
-            window.scrollTo(0, y);
-            attempts += 1;
-            if (attempts < maxAttempts) {
-                setTimeout(restore, 60);
-            } else {
-                sessionStorage.removeItem(COST_SCROLL_KEY);
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "保存失败");
             }
-        };
-        restore();
-    } catch (e) {}
+
+            if (submitBtn) submitBtn.textContent = "已保存";
+            const panel = form.parentElement;
+            const priceBox = panel ? panel.querySelector(".num") : null;
+            const v = Number(priceInput ? priceInput.value : "0");
+            if (priceBox && !Number.isNaN(v)) {
+                priceBox.textContent = "¥ " + v.toFixed(2);
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "保存成本价";
+                }, 900);
+            }
+        }
+    });
 });
 </script>
 </body>
@@ -4699,10 +4727,17 @@ def save_item_price_route():
     keyword = request.form.get("q", "").strip()
     steam_id_filter = request.form.get("steam_id_filter", "").strip()
 
+    is_ajax = request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest"
+
     if not steam_id or not asset_id:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "保存单品成本价失败：缺少必要参数"}), 400
         return redirect(url_for("accounts_page", error="保存单品成本价失败：缺少必要参数"))
 
     save_item_purchase_price(steam_id, app_id, asset_id, purchase_price)
+
+    if is_ajax:
+        return jsonify({"ok": True, "msg": "单品购入成本价保存成功"})
 
     if return_all:
         return redirect(url_for(
