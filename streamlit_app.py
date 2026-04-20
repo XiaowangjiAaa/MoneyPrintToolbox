@@ -1028,6 +1028,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
         asset_id = str(item.get("assetId", "") or "").strip()
         if not asset_id:
             continue
+        original_asset_id = str(asset_info.get("originalAssetId", "") or "").strip()
 
         current_asset_ids.add(asset_id)
         upsert_asset_owner(cur, app_id=app_id, asset_id=asset_id, steam_id=steam_id, current_time=current_time)
