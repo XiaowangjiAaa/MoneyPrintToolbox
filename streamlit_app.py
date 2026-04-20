@@ -311,6 +311,7 @@ def init_db():
         app_id TEXT NOT NULL,
         item_key TEXT NOT NULL,
         asset_id TEXT NOT NULL,
+        original_asset_id TEXT,
         token TEXT,
         style_token TEXT,
         name TEXT,
@@ -333,6 +334,8 @@ def init_db():
     inventory_cols = [str(r["name"]) for r in cur.fetchall()]
     if "cost_price" not in inventory_cols:
         cur.execute("ALTER TABLE inventory_items ADD COLUMN cost_price REAL DEFAULT 0")
+    if "original_asset_id" not in inventory_cols:
+        cur.execute("ALTER TABLE inventory_items ADD COLUMN original_asset_id TEXT")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS asset_ownership_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -386,6 +389,7 @@ def init_db():
         status_name TEXT,
         order_create_time INTEGER,
         asset_id TEXT,
+        original_asset_id TEXT,
         style_id TEXT,
         wear TEXT,
         weapon_name TEXT,
@@ -393,6 +397,10 @@ def init_db():
         updated_at TEXT
     )
     """)
+    cur.execute("PRAGMA table_info(seller_orders)")
+    order_cols = [str(r["name"]) for r in cur.fetchall()]
+    if "original_asset_id" not in order_cols:
+        cur.execute("ALTER TABLE seller_orders ADD COLUMN original_asset_id TEXT")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sync_meta (
         key TEXT PRIMARY KEY,
@@ -506,6 +514,7 @@ def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
         "steam_id": str(steam_id or "").strip(),
         "app_id": str(app_id or "").strip(),
         "asset_id": asset_id,
+        "original_asset_id": str(asset_info.get("originalAssetId", "") or "").strip(),
         "name": item.get("name", ""),
         "short_name": item.get("shortName", ""),
         "price": safe_float(item.get("price", 0), 0),
@@ -572,13 +581,21 @@ def find_asset_in_snapshots(asset_id, app_id=None):
                 data = json.load(f)
             if not isinstance(data, dict):
                 continue
-            entry = data.get(asset_id)
-            if not isinstance(entry, dict):
-                continue
-            entry_app_id = str(entry.get("app_id", "") or "").strip()
-            if app_id and entry_app_id and entry_app_id != app_id:
-                continue
-            hits.append(entry)
+            direct = data.get(asset_id)
+            if isinstance(direct, dict):
+                entry_app_id = str(direct.get("app_id", "") or "").strip()
+                if not (app_id and entry_app_id and entry_app_id != app_id):
+                    hits.append(direct)
+            for v in data.values():
+                if not isinstance(v, dict):
+                    continue
+                orig = str(v.get("original_asset_id", "") or "").strip()
+                if orig != asset_id:
+                    continue
+                entry_app_id = str(v.get("app_id", "") or "").strip()
+                if app_id and entry_app_id and entry_app_id != app_id:
+                    continue
+                hits.append(v)
         except Exception:
             continue
     hits.sort(key=lambda x: str(x.get("updated_at", "") or ""), reverse=True)
@@ -1022,13 +1039,14 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
         cur.execute("""
         INSERT INTO inventory_items (
-            steam_id, app_id, item_key, asset_id, token, style_token,
+            steam_id, app_id, item_key, asset_id, original_asset_id, token, style_token,
             name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(steam_id, app_id, asset_id) DO UPDATE SET
             item_key=excluded.item_key,
+            original_asset_id=excluded.original_asset_id,
             token=excluded.token,
             style_token=excluded.style_token,
             name=excluded.name,
@@ -1047,7 +1065,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
             exterior_name=excluded.exterior_name,
             updated_at=excluded.updated_at
         """, (
-            steam_id, app_id, item_key, asset_id, token, style_token,
+            steam_id, app_id, item_key, asset_id, original_asset_id, token, style_token,
             name, short_name, image_url, price, cost_price,
             status, if_tradable, wear, style_id, weapon_name, exterior_name, current_time
         ))
@@ -1113,244 +1131,258 @@ def build_asset_owner_map(app_id=DEFAULT_APP_ID):
     return owner_map
 
 
-def lookup_resolved_steam_id_by_asset(app_id, asset_id):
+def build_asset_candidates(asset_id, original_asset_id=""):
+    candidates = []
+    a1 = str(asset_id or "").strip()
+    a2 = str(original_asset_id or "").strip()
+    if a1:
+        candidates.append(a1)
+    if a2 and a2 not in candidates:
+        candidates.append(a2)
+    return candidates
+
+
+def lookup_resolved_steam_id_by_asset(app_id, asset_id, original_asset_id=""):
     app_id = str(app_id or "").strip()
-    asset_id = str(asset_id or "").strip()
-    if not app_id or not asset_id:
+    candidates = build_asset_candidates(asset_id, original_asset_id)
+    if not app_id or not candidates:
         return "", "none"
 
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # 1) 先查归属历史（最稳定）
-    cur.execute("""
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        # 1) 先查归属历史（最稳定）
+        cur.execute("""
     SELECT steam_id
     FROM asset_ownership_history
     WHERE app_id = ? AND asset_id = ?
     ORDER BY last_seen_at DESC
     LIMIT 1
-    """, (app_id, asset_id))
-    row = cur.fetchone()
-    if row and str(row["steam_id"] or "").strip():
-        conn.close()
-        return str(row["steam_id"]).strip(), "asset_ownership_history"
-
-    # 2) 再查当前库存（仍持有该 asset 的账号）
-    cur.execute("""
+        """, (app_id, candidate))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            conn.close()
+            return str(row["steam_id"]).strip(), "asset_ownership_history"
+        # 2) 再查当前库存
+        cur.execute("""
     SELECT steam_id
     FROM inventory_items
-    WHERE app_id = ? AND asset_id = ?
+    WHERE app_id = ? AND (asset_id = ? OR original_asset_id = ?)
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (app_id, asset_id))
-    row = cur.fetchone()
-    if row and str(row["steam_id"] or "").strip():
-        conn.close()
-        return str(row["steam_id"]).strip(), "inventory_items"
-
-    # 3) 最后查已沉淀的单品成本记录（说明这个 asset 曾经被某账号标过成本）
-    cur.execute("""
+    """, (app_id, candidate, candidate))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            conn.close()
+            return str(row["steam_id"]).strip(), "inventory_items"
+        # 3) 单品成本记录
+        cur.execute("""
     SELECT steam_id
     FROM item_purchase_prices
     WHERE app_id = ? AND asset_id = ?
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (app_id, asset_id))
-    row = cur.fetchone()
-    conn.close()
-    if row and str(row["steam_id"] or "").strip():
-        return str(row["steam_id"]).strip(), "item_purchase_prices"
-
-    # 4) 快照兜底（每个 steam_id + app_id 的库存记忆文件）
-    snapshot_hits = find_asset_in_snapshots(asset_id, app_id=app_id)
-    if snapshot_hits:
-        steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
-        if steam:
-            return steam, "snapshot(app)"
+        """, (app_id, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row and str(row["steam_id"] or "").strip():
+            return str(row["steam_id"]).strip(), "item_purchase_prices"
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id)
+        if snapshot_hits:
+            steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
+            if steam:
+                return steam, "snapshot(app)"
 
     # 5) 兜底：忽略 app_id，全库按 asset_id 搜（兼容历史脏数据 app_id 缺失/不一致）
     cur = get_conn().cursor()
-    cur.execute("""
+    for candidate in candidates:
+        cur.execute("""
     SELECT steam_id
     FROM asset_ownership_history
     WHERE asset_id = ?
     ORDER BY last_seen_at DESC
     LIMIT 1
-    """, (asset_id,))
-    row = cur.fetchone()
-    if row and str(row["steam_id"] or "").strip():
-        cur.connection.close()
-        return str(row["steam_id"]).strip(), "asset_ownership_history(global)"
+    """, (candidate,))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            cur.connection.close()
+            return str(row["steam_id"]).strip(), "asset_ownership_history(global)"
 
-    cur.execute("""
+        cur.execute("""
     SELECT steam_id
     FROM inventory_items
-    WHERE asset_id = ?
+    WHERE asset_id = ? OR original_asset_id = ?
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (asset_id,))
-    row = cur.fetchone()
-    if row and str(row["steam_id"] or "").strip():
-        cur.connection.close()
-        return str(row["steam_id"]).strip(), "inventory_items(global)"
+    """, (candidate, candidate))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            cur.connection.close()
+            return str(row["steam_id"]).strip(), "inventory_items(global)"
 
-    cur.execute("""
+        cur.execute("""
     SELECT steam_id
     FROM item_purchase_prices
     WHERE asset_id = ?
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (asset_id,))
-    row = cur.fetchone()
-    cur.connection.close()
-    if row and str(row["steam_id"] or "").strip():
-        return str(row["steam_id"]).strip(), "item_purchase_prices(global)"
+    """, (candidate,))
+        row = cur.fetchone()
+        if row and str(row["steam_id"] or "").strip():
+            cur.connection.close()
+            return str(row["steam_id"]).strip(), "item_purchase_prices(global)"
 
-    snapshot_hits = find_asset_in_snapshots(asset_id, app_id=None)
-    if snapshot_hits:
-        steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
-        if steam:
-            return steam, "snapshot(global)"
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=None)
+        if snapshot_hits:
+            steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
+            if steam:
+                cur.connection.close()
+                return steam, "snapshot(global)"
+    cur.connection.close()
 
     return "", "none"
 
 
-def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id=""):
+def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id="", original_asset_id=""):
     app_id = str(app_id or "").strip()
-    asset_id = str(asset_id or "").strip()
     steam_id = str(steam_id or "").strip()
-    if not app_id or not asset_id:
+    candidates = build_asset_candidates(asset_id, original_asset_id)
+    if not app_id or not candidates:
         return 0.0
 
-    conn = get_conn()
-    cur = conn.cursor()
-    if steam_id:
-        cur.execute("""
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
         SELECT purchase_price
         FROM item_purchase_prices
         WHERE steam_id = ? AND app_id = ? AND asset_id = ?
         LIMIT 1
-        """, (steam_id, app_id, asset_id))
-        row = cur.fetchone()
-        if row:
-            conn.close()
-            return safe_float(row["purchase_price"], 0)
+        """, (steam_id, app_id, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["purchase_price"], 0)
 
-    cur.execute("""
+        cur.execute("""
     SELECT purchase_price
     FROM item_purchase_prices
     WHERE app_id = ? AND asset_id = ?
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (app_id, asset_id))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return safe_float(row["purchase_price"], 0)
+    """, (app_id, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["purchase_price"], 0)
 
     # 兜底：忽略 app_id
-    conn = get_conn()
-    cur = conn.cursor()
-    if steam_id:
-        cur.execute("""
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
         SELECT purchase_price
         FROM item_purchase_prices
         WHERE steam_id = ? AND asset_id = ?
         ORDER BY updated_at DESC
         LIMIT 1
-        """, (steam_id, asset_id))
-        row = cur.fetchone()
-        if row:
-            conn.close()
-            return safe_float(row["purchase_price"], 0)
-    cur.execute("""
+        """, (steam_id, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["purchase_price"], 0)
+        cur.execute("""
     SELECT purchase_price
     FROM item_purchase_prices
     WHERE asset_id = ?
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (asset_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        snapshot_hits = find_asset_in_snapshots(asset_id, app_id=app_id if app_id else None)
+    """, (candidate,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["purchase_price"], 0)
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id if app_id else None)
         if steam_id:
             for hit in snapshot_hits:
                 if str(hit.get("steam_id", "") or "").strip() == steam_id:
                     return safe_float(hit.get("cost_price", 0), 0)
         if snapshot_hits:
             return safe_float(snapshot_hits[0].get("cost_price", 0), 0)
-        return 0.0
-    return safe_float(row["purchase_price"], 0)
+    return 0.0
 
 
-def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id=""):
+def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id="", original_asset_id=""):
     app_id = str(app_id or "").strip()
-    asset_id = str(asset_id or "").strip()
     steam_id = str(steam_id or "").strip()
-    if not app_id or not asset_id:
+    candidates = build_asset_candidates(asset_id, original_asset_id)
+    if not app_id or not candidates:
         return 0.0
 
-    conn = get_conn()
-    cur = conn.cursor()
-    if steam_id:
-        cur.execute("""
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
         SELECT cost_price
         FROM inventory_items
-        WHERE steam_id = ? AND app_id = ? AND asset_id = ?
+        WHERE steam_id = ? AND app_id = ? AND (asset_id = ? OR original_asset_id = ?)
         LIMIT 1
-        """, (steam_id, app_id, asset_id))
-        row = cur.fetchone()
-        if row:
-            conn.close()
-            return safe_float(row["cost_price"], 0)
+        """, (steam_id, app_id, candidate, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["cost_price"], 0)
 
-    cur.execute("""
+        cur.execute("""
     SELECT cost_price
     FROM inventory_items
-    WHERE app_id = ? AND asset_id = ?
+    WHERE app_id = ? AND (asset_id = ? OR original_asset_id = ?)
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (app_id, asset_id))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return safe_float(row["cost_price"], 0)
+    """, (app_id, candidate, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["cost_price"], 0)
 
     # 兜底：忽略 app_id
-    conn = get_conn()
-    cur = conn.cursor()
-    if steam_id:
-        cur.execute("""
+    for candidate in candidates:
+        conn = get_conn()
+        cur = conn.cursor()
+        if steam_id:
+            cur.execute("""
         SELECT cost_price
         FROM inventory_items
-        WHERE steam_id = ? AND asset_id = ?
+        WHERE steam_id = ? AND (asset_id = ? OR original_asset_id = ?)
         ORDER BY updated_at DESC
         LIMIT 1
-        """, (steam_id, asset_id))
-        row = cur.fetchone()
-        if row:
-            conn.close()
-            return safe_float(row["cost_price"], 0)
-    cur.execute("""
+        """, (steam_id, candidate, candidate))
+            row = cur.fetchone()
+            if row:
+                conn.close()
+                return safe_float(row["cost_price"], 0)
+        cur.execute("""
     SELECT cost_price
     FROM inventory_items
-    WHERE asset_id = ?
+    WHERE asset_id = ? OR original_asset_id = ?
     ORDER BY updated_at DESC
     LIMIT 1
-    """, (asset_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        snapshot_hits = find_asset_in_snapshots(asset_id, app_id=app_id if app_id else None)
+    """, (candidate, candidate))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return safe_float(row["cost_price"], 0)
+        snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id if app_id else None)
         if steam_id:
             for hit in snapshot_hits:
                 if str(hit.get("steam_id", "") or "").strip() == steam_id:
                     return safe_float(hit.get("cost_price", 0), 0)
         if snapshot_hits:
             return safe_float(snapshot_hits[0].get("cost_price", 0), 0)
-        return 0.0
-    return safe_float(row["cost_price"], 0)
+    return 0.0
 
 
 def lookup_account_name(steam_id):
@@ -1434,6 +1466,7 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 status_name = order.get("statusName", "")
                 order_create_time = int(order.get("orderCreateTime", 0) or 0)
                 asset_id = str(asset_info.get("assetId", "") or "")
+                original_asset_id = str(asset_info.get("originalAssetId", "") or "")
                 style_id = str(asset_info.get("styleId", "") or "")
                 wear = str(asset_info.get("wear", "") or "")
                 weapon_name = item_info.get("weaponName", "")
@@ -1460,9 +1493,9 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 INSERT INTO seller_orders (
                     order_id, steam_id, product_id, app_id, item_id, name, market_hash_name,
                     image_url, order_price, order_status, status_name, order_create_time,
-                    asset_id, style_id, wear, weapon_name, exterior_name, updated_at
+                    asset_id, original_asset_id, style_id, wear, weapon_name, exterior_name, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     steam_id=excluded.steam_id,
                     product_id=excluded.product_id,
@@ -1476,6 +1509,7 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                     status_name=excluded.status_name,
                     order_create_time=excluded.order_create_time,
                     asset_id=excluded.asset_id,
+                    original_asset_id=excluded.original_asset_id,
                     style_id=excluded.style_id,
                     wear=excluded.wear,
                     weapon_name=excluded.weapon_name,
@@ -1484,7 +1518,7 @@ def sync_seller_orders_to_db(app_id=DEFAULT_APP_ID, status="10"):
                 """, (
                     order_id, steam_id, product_id, str(app_id), item_id, name, market_hash_name,
                     image_url, order_price, order_status, status_name, order_create_time,
-                    asset_id, style_id, wear, weapon_name, exterior_name, current_time
+                    asset_id, original_asset_id, style_id, wear, weapon_name, exterior_name, current_time
                 ))
                 processed_orders += 1
                 new_orders += 1
@@ -1796,6 +1830,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
         o.status_name,
         o.order_create_time,
         o.asset_id,
+        o.original_asset_id,
         o.style_id,
         o.wear,
         o.weapon_name,
@@ -1902,15 +1937,16 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
     for row in rows:
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
         asset_id = str(row.get("asset_id", "") or "").strip()
+        original_asset_id = str(row.get("original_asset_id", "") or "").strip()
         row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         item_name = str(row.get("name", "") or "")
 
         if not resolved_steam_id and asset_id:
-            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id)
+            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
 
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         if item_cost <= 0 and asset_id:
-            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id)
+            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
 
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
         if group_cost <= 0 and resolved_steam_id and item_name:
@@ -1918,7 +1954,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
 
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
         if inventory_cost <= 0 and asset_id:
-            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id)
+            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
         cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
 
         order_price = safe_float(row.get("order_price", 0), 0)
@@ -1944,6 +1980,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
             "order_create_time": int(row.get("order_create_time", 0) or 0),
             "order_create_time_str": unix_ms_to_str(row.get("order_create_time", 0)),
             "asset_id": asset_id,
+            "original_asset_id": original_asset_id,
             "style_id": str(row.get("style_id", "") or ""),
             "wear": str(row.get("wear", "") or ""),
             "weapon_name": row.get("weapon_name", ""),
@@ -1974,6 +2011,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         o.name,
         o.market_hash_name,
         o.asset_id,
+        o.original_asset_id,
         o.style_id,
         COALESCE(NULLIF(o.steam_id, ''), ah.steam_id) AS resolved_steam_id,
         o.weapon_name,
@@ -2052,15 +2090,16 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     for row in rows:
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
         asset_id = str(row.get("asset_id", "") or "").strip()
+        original_asset_id = str(row.get("original_asset_id", "") or "").strip()
         row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         item_name = str(row.get("name", "") or "")
 
         if not resolved_steam_id and asset_id:
-            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id)
+            resolved_steam_id, _ = lookup_resolved_steam_id_by_asset(row_app_id, asset_id, original_asset_id)
 
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         if item_cost <= 0 and asset_id:
-            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id)
+            item_cost = lookup_item_purchase_price_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
 
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
         if group_cost <= 0 and resolved_steam_id and item_name:
@@ -2068,7 +2107,7 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
 
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
         if inventory_cost <= 0 and asset_id:
-            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id)
+            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, asset_id, resolved_steam_id, original_asset_id)
         cost_price = item_cost if item_cost > 0 else (group_cost if group_cost > 0 else inventory_cost)
         if cost_price <= 0:
             continue
@@ -2104,6 +2143,7 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
         o.order_create_time,
         o.app_id,
         o.asset_id,
+        o.original_asset_id,
         o.name,
         o.market_hash_name,
         o.steam_id AS order_steam_id,
@@ -2144,16 +2184,17 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
     for row in rows:
         row_app_id = str(row.get("app_id", "") or "").strip() or str(app_id)
         row_asset_id = str(row.get("asset_id", "") or "").strip()
+        row_original_asset_id = str(row.get("original_asset_id", "") or "").strip()
         row_name = str(row.get("name", "") or "")
         resolved_steam_id = str(row.get("resolved_steam_id", "") or "").strip()
         resolve_source = "order_or_history"
 
         if not resolved_steam_id and row_asset_id:
-            resolved_steam_id, resolve_source = lookup_resolved_steam_id_by_asset(row_app_id, row_asset_id)
+            resolved_steam_id, resolve_source = lookup_resolved_steam_id_by_asset(row_app_id, row_asset_id, row_original_asset_id)
 
         item_cost = safe_float(row.get("item_purchase_price", 0), 0)
         if item_cost <= 0 and row_asset_id:
-            item_cost = lookup_item_purchase_price_by_asset(row_app_id, row_asset_id, resolved_steam_id)
+            item_cost = lookup_item_purchase_price_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
 
         group_cost = safe_float(row.get("group_purchase_price", 0), 0)
         if group_cost <= 0 and resolved_steam_id and row_name:
@@ -2161,7 +2202,7 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
 
         inventory_cost = safe_float(row.get("inventory_cost_price", 0), 0)
         if inventory_cost <= 0 and row_asset_id:
-            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, row_asset_id, resolved_steam_id)
+            inventory_cost = lookup_inventory_cost_by_asset(row_app_id, row_asset_id, resolved_steam_id, row_original_asset_id)
 
         if item_cost > 0:
             cost_source = "单品成本(item_purchase_prices)"
@@ -2193,6 +2234,7 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
             "name": row.get("name", ""),
             "market_hash_name": row.get("market_hash_name", ""),
             "asset_id": row_asset_id,
+            "original_asset_id": row_original_asset_id,
             "app_id": str(row.get("app_id", "") or ""),
             "order_price": order_price,
             "order_steam_id": str(row.get("order_steam_id", "") or ""),
@@ -4162,6 +4204,7 @@ def profit_debug_page():
             </div>
             <div class="row" style="margin-top:10px;">
                 <div><div class="k">asset_id</div><div class="v">{{ r.asset_id }}</div></div>
+                <div><div class="k">original_asset_id</div><div class="v">{{ r.original_asset_id or '-' }}</div></div>
                 <div><div class="k">订单内 steam_id</div><div class="v">{{ r.order_steam_id or '-' }}</div></div>
                 <div><div class="k">归属历史 steam_id</div><div class="v">{{ r.owner_steam_id or '-' }}</div></div>
                 <div><div class="k">最终回溯 steam_id</div><div class="v">{{ r.resolved_steam_id or '-' }}</div></div>
