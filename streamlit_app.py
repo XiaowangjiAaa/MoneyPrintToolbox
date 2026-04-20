@@ -511,6 +511,11 @@ def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
         cost_price = safe_float(existing_entry.get("cost_price", 0), 0)
 
     return {
+        "steamId": str(steam_id or "").strip(),
+        "appId": str(app_id or "").strip(),
+        "assetId": asset_id,
+        "originalAssetId": str(asset_info.get("originalAssetId", "") or "").strip(),
+        # 兼容旧快照字段
         "steam_id": str(steam_id or "").strip(),
         "app_id": str(app_id or "").strip(),
         "asset_id": asset_id,
@@ -518,6 +523,7 @@ def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
         "name": item.get("name", ""),
         "short_name": item.get("shortName", ""),
         "price": safe_float(item.get("price", 0), 0),
+        "costPrice": cost_price,
         "cost_price": cost_price,
         "status": int(item.get("status", 0) or 0),
         "if_tradable": bool_to_int(item.get("ifTradable", False)),
@@ -525,6 +531,7 @@ def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
         "wear": str(asset_info.get("wear", "") or ""),
         "weapon_name": item_info.get("weaponName", ""),
         "exterior_name": item_info.get("exteriorName", ""),
+        "updatedAt": now_str(),
         "updated_at": now_str(),
     }
 
@@ -559,11 +566,19 @@ def update_inventory_snapshot_cost(steam_id, app_id, asset_id, cost_price):
     entry = snapshot.get(asset_id, {})
     if not isinstance(entry, dict):
         entry = {}
+    normalized_cost = safe_float(cost_price, 0)
+    now = now_str()
+    entry["steamId"] = steam_id
+    entry["appId"] = app_id
+    entry["assetId"] = asset_id
+    entry["costPrice"] = normalized_cost
+    entry["updatedAt"] = now
+    # 兼容旧字段
     entry["steam_id"] = steam_id
     entry["app_id"] = app_id
     entry["asset_id"] = asset_id
-    entry["cost_price"] = safe_float(cost_price, 0)
-    entry["updated_at"] = now_str()
+    entry["cost_price"] = normalized_cost
+    entry["updated_at"] = now
     snapshot[asset_id] = entry
     save_inventory_snapshot(steam_id, app_id, snapshot)
 
@@ -583,22 +598,23 @@ def find_asset_in_snapshots(asset_id, app_id=None):
                 continue
             direct = data.get(asset_id)
             if isinstance(direct, dict):
-                entry_app_id = str(direct.get("app_id", "") or "").strip()
+                entry_app_id = str(direct.get("appId", direct.get("app_id", "")) or "").strip()
                 if not (app_id and entry_app_id and entry_app_id != app_id):
                     hits.append(direct)
             for v in data.values():
                 if not isinstance(v, dict):
                     continue
-                orig = str(v.get("original_asset_id", "") or "").strip()
-                if orig != asset_id:
+                orig = str(v.get("originalAssetId", v.get("original_asset_id", "")) or "").strip()
+                aid = str(v.get("assetId", v.get("asset_id", "")) or "").strip()
+                if orig != asset_id and aid != asset_id:
                     continue
-                entry_app_id = str(v.get("app_id", "") or "").strip()
+                entry_app_id = str(v.get("appId", v.get("app_id", "")) or "").strip()
                 if app_id and entry_app_id and entry_app_id != app_id:
                     continue
                 hits.append(v)
         except Exception:
             continue
-    hits.sort(key=lambda x: str(x.get("updated_at", "") or ""), reverse=True)
+    hits.sort(key=lambda x: str(x.get("updatedAt", x.get("updated_at", "")) or ""), reverse=True)
     return hits
 
 
@@ -1135,10 +1151,11 @@ def build_asset_candidates(asset_id, original_asset_id=""):
     candidates = []
     a1 = str(asset_id or "").strip()
     a2 = str(original_asset_id or "").strip()
-    if a1:
-        candidates.append(a1)
-    if a2 and a2 not in candidates:
+    # 订单侧优先 originalAssetId（通常更接近库存侧的 assetId）
+    if a2:
         candidates.append(a2)
+    if a1 and a1 not in candidates:
+        candidates.append(a1)
     return candidates
 
 
@@ -1189,7 +1206,7 @@ def lookup_resolved_steam_id_by_asset(app_id, asset_id, original_asset_id=""):
             return str(row["steam_id"]).strip(), "item_purchase_prices"
         snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id)
         if snapshot_hits:
-            steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
+            steam = str(snapshot_hits[0].get("steamId", snapshot_hits[0].get("steam_id", "")) or "").strip()
             if steam:
                 return steam, "snapshot(app)"
 
@@ -1234,7 +1251,7 @@ def lookup_resolved_steam_id_by_asset(app_id, asset_id, original_asset_id=""):
 
         snapshot_hits = find_asset_in_snapshots(candidate, app_id=None)
         if snapshot_hits:
-            steam = str(snapshot_hits[0].get("steam_id", "") or "").strip()
+            steam = str(snapshot_hits[0].get("steamId", snapshot_hits[0].get("steam_id", "")) or "").strip()
             if steam:
                 cur.connection.close()
                 return steam, "snapshot(global)"
@@ -1307,10 +1324,10 @@ def lookup_item_purchase_price_by_asset(app_id, asset_id, steam_id="", original_
         snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id if app_id else None)
         if steam_id:
             for hit in snapshot_hits:
-                if str(hit.get("steam_id", "") or "").strip() == steam_id:
-                    return safe_float(hit.get("cost_price", 0), 0)
+                if str(hit.get("steamId", hit.get("steam_id", "")) or "").strip() == steam_id:
+                    return safe_float(hit.get("costPrice", hit.get("cost_price", 0)), 0)
         if snapshot_hits:
-            return safe_float(snapshot_hits[0].get("cost_price", 0), 0)
+            return safe_float(snapshot_hits[0].get("costPrice", snapshot_hits[0].get("cost_price", 0)), 0)
     return 0.0
 
 
@@ -1378,10 +1395,10 @@ def lookup_inventory_cost_by_asset(app_id, asset_id, steam_id="", original_asset
         snapshot_hits = find_asset_in_snapshots(candidate, app_id=app_id if app_id else None)
         if steam_id:
             for hit in snapshot_hits:
-                if str(hit.get("steam_id", "") or "").strip() == steam_id:
-                    return safe_float(hit.get("cost_price", 0), 0)
+                if str(hit.get("steamId", hit.get("steam_id", "")) or "").strip() == steam_id:
+                    return safe_float(hit.get("costPrice", hit.get("cost_price", 0)), 0)
         if snapshot_hits:
-            return safe_float(snapshot_hits[0].get("cost_price", 0), 0)
+            return safe_float(snapshot_hits[0].get("costPrice", snapshot_hits[0].get("cost_price", 0)), 0)
     return 0.0
 
 
