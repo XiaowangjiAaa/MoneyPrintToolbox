@@ -3717,7 +3717,7 @@ ALL_INVENTORY_TEMPLATE = """
                 <div class="num">¥ {{ "%.2f"|format(item.price) }}</div>
                 <div>
                     <div class="num">¥ {{ "%.2f"|format(item.purchase_price) }}</div>
-                    <form class="compact-price-form" method="post" action="/save_item_price" style="margin-top:8px;">
+                    <form class="compact-price-form cost-save-form" method="post" action="/save_item_price" style="margin-top:8px;">
                         <input type="hidden" name="steam_id" value="{{ item.steam_id }}">
                         <input type="hidden" name="app_id" value="{{ item.app_id }}">
                         <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
@@ -3779,6 +3779,24 @@ ALL_INVENTORY_TEMPLATE = """
         <div class="empty">当前没有库存数据，请先同步所有账号库存</div>
     {% endif %}
 </div>
+<script>
+// 解决“保存成本价后页面回到顶部”的问题：提交前记录滚动位置，返回后恢复。
+document.querySelectorAll('.cost-save-form').forEach(form => {
+    form.addEventListener('submit', () => {
+        try {
+            sessionStorage.setItem('all_inventory_scroll_y', String(window.scrollY || 0));
+        } catch (e) {}
+    });
+});
+try {
+    const rawY = sessionStorage.getItem('all_inventory_scroll_y');
+    if (rawY !== null) {
+        const y = Number(rawY || 0);
+        window.scrollTo(0, isNaN(y) ? 0 : y);
+        sessionStorage.removeItem('all_inventory_scroll_y');
+    }
+} catch (e) {}
+</script>
 </body>
 </html>
 """
