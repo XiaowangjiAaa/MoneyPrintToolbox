@@ -30,6 +30,7 @@ APP_KEY = load_config()
 DEFAULT_APP_ID = "730"
 DB_PATH = "steam_inventory_app.db"
 FAILED_SYNC_FILE = "failed_inventory_sync.json"
+INVENTORY_SYNC_SUMMARY_FILE = "inventory_sync_summary.json"
 IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cached_images")
 INVENTORY_SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "inventory_snapshots")
 PROFIT_ANALYSIS_CACHE_DIR = os.path.join(os.path.dirname(__file__), "profit_analysis_cache")
@@ -119,24 +120,50 @@ def request_cancel_sync():
 def _inventory_sync_worker(app_id):
     error = sync_accounts_to_db()
     if error:
+        ended = now_str()
         update_sync_state(
             running=False,
             current_steam_id="",
             last_error=f"同步所有账号失败：{error}",
             last_message="库存同步任务启动失败",
-            ended_at=now_str(),
+            ended_at=ended,
         )
+        save_inventory_sync_summary({
+            "ended_at": ended,
+            "app_id": str(app_id),
+            "total": 0,
+            "synced_count": 0,
+            "success_count": 0,
+            "empty_count": 0,
+            "failed_count": 0,
+            "failed_ids": [],
+            "last_message": "库存同步任务启动失败",
+            "last_error": f"同步所有账号失败：{error}",
+        })
         return
 
     accounts = get_all_accounts_from_db()
     if not accounts:
+        ended = now_str()
         update_sync_state(
             running=False,
             current_steam_id="",
             last_error="没有可用账号，无法同步库存",
             last_message="没有可用账号，无法同步库存",
-            ended_at=now_str(),
+            ended_at=ended,
         )
+        save_inventory_sync_summary({
+            "ended_at": ended,
+            "app_id": str(app_id),
+            "total": 0,
+            "synced_count": 0,
+            "success_count": 0,
+            "empty_count": 0,
+            "failed_count": 0,
+            "failed_ids": [],
+            "last_message": "没有可用账号，无法同步库存",
+            "last_error": "没有可用账号，无法同步库存",
+        })
         return
 
     update_sync_state(
@@ -211,6 +238,7 @@ def _inventory_sync_worker(app_id):
     if len(failed_msgs) > 8:
         last_error += f" ... 其余 {len(failed_msgs) - 8} 个失败"
 
+    ended = now_str()
     update_sync_state(
         running=False,
         cancel_requested=False,
@@ -223,8 +251,20 @@ def _inventory_sync_worker(app_id):
         failed_messages=list(failed_msgs[:20]),
         last_message=last_message,
         last_error=last_error,
-        ended_at=now_str(),
+        ended_at=ended,
     )
+    save_inventory_sync_summary({
+        "ended_at": ended,
+        "app_id": str(app_id),
+        "total": int(final_state["total"] or 0),
+        "synced_count": int(final_state["finished"] or 0),
+        "success_count": int(success_count or 0),
+        "empty_count": int(empty_count or 0),
+        "failed_count": int(len(failed_ids)),
+        "failed_ids": list(failed_ids),
+        "last_message": last_message,
+        "last_error": last_error,
+    })
 
 
 def start_inventory_sync_background(app_id=DEFAULT_APP_ID):
@@ -770,6 +810,24 @@ def load_failed_sync_ids():
             return data.get("failed_ids", [])
     except Exception:
         return []
+
+
+def save_inventory_sync_summary(summary):
+    payload = summary if isinstance(summary, dict) else {}
+    try:
+        with open(INVENTORY_SYNC_SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[写入库存同步摘要失败] {e}")
+
+
+def load_inventory_sync_summary():
+    try:
+        with open(INVENTORY_SYNC_SUMMARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def translate_status(status):
@@ -2623,6 +2681,19 @@ ACCOUNTS_TEMPLATE = """
             <div class="stat-label">账号总数</div>
             <div class="stat-value">{{ steam_accounts|length }}</div>
         </div>
+        <div class="stat">
+            <div class="stat-label">上次库存同步时间</div>
+            <div class="stat-value" style="font-size:20px;">{{ last_sync_summary.ended_at or '-' }}</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">上次同步：已同步 / 失败</div>
+            <div class="stat-value" style="font-size:20px;">
+                {{ last_sync_summary.synced_count or 0 }} / {{ last_sync_summary.failed_count or 0 }}
+            </div>
+            <div class="sub" style="margin-top:8px;">
+                未同步账号：{{ (last_sync_summary.failed_ids or [])|join(' / ') if (last_sync_summary.failed_ids or []) else '无' }}
+            </div>
+        </div>
     </div>
 
     {% if steam_accounts %}
@@ -4089,6 +4160,7 @@ def accounts_page():
     steam_accounts = get_all_accounts_from_db()
     sync_status = get_sync_state()
     failed_ids = load_failed_sync_ids()
+    last_sync_summary = load_inventory_sync_summary()
 
     return render_template_string(
         ACCOUNTS_TEMPLATE,
@@ -4096,7 +4168,8 @@ def accounts_page():
         error=error,
         steam_accounts=steam_accounts,
         sync_status=sync_status,
-        failed_ids=failed_ids
+        failed_ids=failed_ids,
+        last_sync_summary=last_sync_summary
     )
 
 
