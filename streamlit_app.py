@@ -516,8 +516,11 @@ def load_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, max_a
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         ts = float(data.get("cached_at_ts", 0) or 0)
-        if ts <= 0 or (time.time() - ts) > max_age_seconds:
+        if ts <= 0:
             return None
+        if max_age_seconds is not None and max_age_seconds > 0:
+            if (time.time() - ts) > max_age_seconds:
+                return None
         return data
     except Exception:
         return None
@@ -541,6 +544,19 @@ def save_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, paylo
             json.dump(body, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[利润缓存写入失败] {path}: {e}")
+
+
+def clear_profit_analysis_cache():
+    ensure_profit_analysis_cache_dir()
+    try:
+        for x in os.listdir(PROFIT_ANALYSIS_CACHE_DIR):
+            if x.endswith(".json"):
+                try:
+                    os.remove(os.path.join(PROFIT_ANALYSIS_CACHE_DIR, x))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=None):
@@ -3820,6 +3836,7 @@ PROFIT_ANALYSIS_TEMPLATE = """
             </form>
 
             <a class="btn" href="/sync/profit_orders">同步利润订单</a>
+            <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page }}&refresh=1">刷新利润数据</a>
             <a class="btn" href="/profit_debug?appId={{ app_id }}">利润诊断</a>
             <a class="btn" href="/">返回主页面</a>
         </div>
@@ -4216,6 +4233,7 @@ def sync_profit_orders():
                 return
 
             updated_count = reconcile_order_owners_by_asset(app_id=app_id, status="10")
+            clear_profit_analysis_cache()
 
             update_profit_sync_state(
                 running=False,
@@ -4247,6 +4265,7 @@ def profit_analysis_page():
     keyword = request.args.get("q", "").strip()
     selected_steam_id = request.args.get("steam_id", "").strip()
     page = request.args.get("page", "1")
+    refresh = request.args.get("refresh", "").strip() == "1"
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
     from_cache = False
@@ -4254,7 +4273,9 @@ def profit_analysis_page():
     accounts = get_all_accounts_from_db()
     safe_page = max(int(page or 1), 1)
     safe_page_size = 100
-    cache_obj = load_profit_analysis_cache(app_id, keyword, selected_steam_id, safe_page, safe_page_size, max_age_seconds=20)
+    cache_obj = None if refresh else load_profit_analysis_cache(
+        app_id, keyword, selected_steam_id, safe_page, safe_page_size, max_age_seconds=None
+    )
 
     if cache_obj and not profit_sync_status.get("running"):
         profit_rows = cache_obj.get("profit_rows", []) or []
