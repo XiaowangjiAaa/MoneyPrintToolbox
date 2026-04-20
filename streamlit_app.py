@@ -3326,7 +3326,7 @@ INVENTORY_TEMPLATE = """
                     </div>
 
                     <div class="action-stack">
-                        <form class="compact-price-form" method="post" action="/save_item_price">
+                        <form class="compact-price-form cost-save-form" method="post" action="/save_item_price">
                             <input type="hidden" name="steam_id" value="{{ steam_id }}">
                             <input type="hidden" name="app_id" value="{{ app_id }}">
                             <input type="hidden" name="asset_id" value="{{ item.asset_id }}">
@@ -3464,6 +3464,40 @@ function applyFilters() {
 }
 
 if (searchInput) searchInput.addEventListener("input", applyFilters);
+
+// 保存成本价前记录滚动位置，返回后恢复，避免页面回到顶部。
+const COST_SCROLL_KEY = "inventory_scroll_y";
+document.querySelectorAll(".cost-save-form").forEach(form => {
+    form.addEventListener("submit", () => {
+        try {
+            sessionStorage.setItem(COST_SCROLL_KEY, String(window.scrollY || 0));
+        } catch (e) {}
+    });
+});
+
+window.addEventListener("load", () => {
+    try {
+        const rawY = sessionStorage.getItem(COST_SCROLL_KEY);
+        if (rawY === null) return;
+        const y = Number(rawY || 0);
+        if (Number.isNaN(y)) {
+            sessionStorage.removeItem(COST_SCROLL_KEY);
+            return;
+        }
+        let attempts = 0;
+        const maxAttempts = 10;
+        const restore = () => {
+            window.scrollTo(0, y);
+            attempts += 1;
+            if (attempts < maxAttempts) {
+                setTimeout(restore, 60);
+            } else {
+                sessionStorage.removeItem(COST_SCROLL_KEY);
+            }
+        };
+        restore();
+    } catch (e) {}
+});
 </script>
 </body>
 </html>
@@ -3780,22 +3814,39 @@ ALL_INVENTORY_TEMPLATE = """
     {% endif %}
 </div>
 <script>
-// 解决“保存成本价后页面回到顶部”的问题：提交前记录滚动位置，返回后恢复。
+// 保存成本价前记录滚动位置，返回后恢复，避免页面回到顶部。
+const COST_SCROLL_KEY = "all_inventory_scroll_y";
 document.querySelectorAll('.cost-save-form').forEach(form => {
     form.addEventListener('submit', () => {
         try {
-            sessionStorage.setItem('all_inventory_scroll_y', String(window.scrollY || 0));
+            sessionStorage.setItem(COST_SCROLL_KEY, String(window.scrollY || 0));
         } catch (e) {}
     });
 });
-try {
-    const rawY = sessionStorage.getItem('all_inventory_scroll_y');
-    if (rawY !== null) {
+
+window.addEventListener("load", () => {
+    try {
+        const rawY = sessionStorage.getItem(COST_SCROLL_KEY);
+        if (rawY === null) return;
         const y = Number(rawY || 0);
-        window.scrollTo(0, isNaN(y) ? 0 : y);
-        sessionStorage.removeItem('all_inventory_scroll_y');
-    }
-} catch (e) {}
+        if (Number.isNaN(y)) {
+            sessionStorage.removeItem(COST_SCROLL_KEY);
+            return;
+        }
+        let attempts = 0;
+        const maxAttempts = 10;
+        const restore = () => {
+            window.scrollTo(0, y);
+            attempts += 1;
+            if (attempts < maxAttempts) {
+                setTimeout(restore, 60);
+            } else {
+                sessionStorage.removeItem(COST_SCROLL_KEY);
+            }
+        };
+        restore();
+    } catch (e) {}
+});
 </script>
 </body>
 </html>
