@@ -1918,6 +1918,8 @@ def save_group_default_purchase_price(steam_id, app_id, group_name, price):
     """, (steam_id, app_id, group_name, safe_float(price, 0), now_str()))
     conn.commit()
     conn.close()
+    clear_profit_summary_cache()
+    clear_profit_analysis_cache()
 
 
 def save_item_purchase_price(steam_id, app_id, asset_id, purchase_price):
@@ -1940,6 +1942,8 @@ def save_item_purchase_price(steam_id, app_id, asset_id, purchase_price):
     conn.commit()
     conn.close()
     update_inventory_snapshot_cost(steam_id, app_id, asset_id, normalized_price)
+    clear_profit_summary_cache()
+    clear_profit_analysis_cache()
 
 
 def get_account_exchange_rate(steam_id, app_id):
@@ -2016,6 +2020,8 @@ def apply_group_price_to_items(steam_id, app_id, group_name, price):
 
     conn.commit()
     conn.close()
+    clear_profit_summary_cache()
+    clear_profit_analysis_cache()
     for row in rows:
         aid = str(row["asset_id"] or "").strip()
         if aid:
