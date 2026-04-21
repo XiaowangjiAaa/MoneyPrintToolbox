@@ -3322,14 +3322,14 @@ INVENTORY_TEMPLATE = """
         <div class="sync-head" style="margin-bottom:8px;">
             <div class="sync-title" style="font-size:16px;">该账号汇率设置（用于美金成本自动换算）</div>
         </div>
-        <form method="post" action="/save_exchange_rate" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <form id="exchangeRateForm" method="post" action="/save_exchange_rate" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
             <input type="hidden" name="steam_id" value="{{ steam_id }}">
             <input type="hidden" name="app_id" value="{{ app_id }}">
             <input class="compact-input" type="number" step="0.0001" min="0" name="exchange_rate"
                    value="{{ '%.4f'|format(exchange_rate or 0) }}" style="max-width:220px;"
                    placeholder="例如 5.0000">
-            <button class="save-btn" type="submit">保存账号汇率</button>
-            <div class="sync-note" style="margin-top:0;">
+            <button id="exchangeRateBtn" class="save-btn" type="submit">保存账号汇率</button>
+            <div id="exchangeRateHint" class="sync-note" style="margin-top:0;">
                 当前汇率：{% if exchange_rate and exchange_rate > 0 %}1 USD = {{ "%.4f"|format(exchange_rate) }}{% else %}未设置{% endif %}
             </div>
         </form>
@@ -3456,12 +3456,14 @@ INVENTORY_TEMPLATE = """
                     </div>
 
                     <div class="action-stack">
-                        <form class="price-form" method="post" action="/save_group_price">
+                        <form class="price-form group-price-form" method="post" action="/save_group_price">
                             <input type="hidden" name="steam_id" value="{{ steam_id }}">
                             <input type="hidden" name="app_id" value="{{ app_id }}">
                             <input type="hidden" name="group_name" value="{{ row.name }}">
                             <input class="price-input" type="number" step="0.01" name="default_purchase_price"
                                    value="{{ "%.2f"|format(row.default_purchase_price) }}">
+                            <input class="price-input" type="number" step="0.01" name="usd_price"
+                                   placeholder="美金价格（可选）">
                             <button class="save-btn" type="submit">保存组成本价</button>
                         </form>
 
@@ -3735,6 +3737,90 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
                 setTimeout(() => {
                     submitBtn.textContent = prevLabel || "保存成本价";
                 }, 900);
+            }
+        }
+    });
+});
+
+// 汇率保存改为异步，避免页面回到顶部。
+const exchangeRateForm = document.getElementById("exchangeRateForm");
+if (exchangeRateForm) {
+    exchangeRateForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const btn = document.getElementById("exchangeRateBtn");
+        const hint = document.getElementById("exchangeRateHint");
+        const rateInput = exchangeRateForm.querySelector('input[name="exchange_rate"]');
+        const oldBtnText = btn ? btn.textContent : "";
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = "保存中...";
+        }
+        try {
+            const resp = await fetch(exchangeRateForm.action, {
+                method: "POST",
+                body: new FormData(exchangeRateForm),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "保存失败");
+            }
+            const rate = Number(data.exchange_rate || (rateInput ? rateInput.value : 0));
+            if (hint && !Number.isNaN(rate) && rate > 0) {
+                hint.textContent = `当前汇率：1 USD = ${rate.toFixed(4)}`;
+            }
+            if (btn) btn.textContent = "已保存";
+        } catch (e) {
+            if (hint) hint.textContent = `保存失败：${e.message || e}`;
+            if (btn) btn.textContent = "保存失败";
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                setTimeout(() => {
+                    btn.textContent = oldBtnText || "保存账号汇率";
+                }, 1000);
+            }
+        }
+    });
+}
+
+// 汇总页组成本也支持“美金价格”并异步保存。
+document.querySelectorAll(".group-price-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const btn = form.querySelector('button[type="submit"]');
+        const rmbInput = form.querySelector('input[name="default_purchase_price"]');
+        const usdInput = form.querySelector('input[name="usd_price"]');
+        const oldBtnText = btn ? btn.textContent : "";
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = "保存中...";
+        }
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "保存失败");
+            }
+            const saved = Number(data.saved_group_price || (rmbInput ? rmbInput.value : 0));
+            if (!Number.isNaN(saved) && rmbInput) {
+                rmbInput.value = saved.toFixed(2);
+            }
+            if (usdInput) usdInput.value = "";
+            if (btn) btn.textContent = "已保存";
+        } catch (e) {
+            if (btn) btn.textContent = "保存失败";
+            console.log("save group price failed", e);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                setTimeout(() => {
+                    btn.textContent = oldBtnText || "保存组成本价";
+                }, 1000);
             }
         }
     });
@@ -4936,19 +5022,45 @@ def save_group_price_route():
     app_id = request.form.get("app_id", DEFAULT_APP_ID).strip()
     group_name = request.form.get("group_name", "").strip()
     default_purchase_price = request.form.get("default_purchase_price", "0").strip()
+    usd_price = request.form.get("usd_price", "").strip()
+    is_ajax = request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest"
 
     if not steam_id or not group_name:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "保存组成本价失败：缺少必要参数"}), 400
         return redirect(url_for("accounts_page", error="保存组成本价失败：缺少必要参数"))
 
-    save_group_default_purchase_price(steam_id, app_id, group_name, default_purchase_price)
-    apply_group_price_to_items(steam_id, app_id, group_name, default_purchase_price)
+    final_group_price = safe_float(default_purchase_price, 0)
+    usd_value = safe_float(usd_price, 0)
+    if usd_price != "":
+        if usd_value <= 0:
+            if is_ajax:
+                return jsonify({"ok": False, "error": "美金价格必须大于 0"}), 400
+            return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="保存失败：美金价格必须大于 0"))
+        rate = get_account_exchange_rate(steam_id, app_id)
+        if rate <= 0:
+            if is_ajax:
+                return jsonify({"ok": False, "error": "请先设置该账号汇率"}), 400
+            return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="保存失败：请先设置该账号汇率"))
+        final_group_price = round(rate * usd_value, 2)
+
+    save_group_default_purchase_price(steam_id, app_id, group_name, final_group_price)
+    apply_group_price_to_items(steam_id, app_id, group_name, final_group_price)
+
+    if is_ajax:
+        return jsonify({
+            "ok": True,
+            "msg": "组成本价保存成功",
+            "saved_group_price": final_group_price,
+            "group_name": group_name
+        })
 
     return redirect(url_for(
         "inventory_page",
         steam_id=steam_id,
         appId=app_id,
         view="summary",
-        msg=f"已保存组默认成本价并同步到组内单品：{group_name}"
+        msg=f"已保存组默认成本价并同步到组内单品：{group_name}（{final_group_price:.2f}）"
     ))
 
 
@@ -5034,15 +5146,22 @@ def save_exchange_rate_route():
     steam_id = request.form.get("steam_id", "").strip()
     app_id = request.form.get("app_id", DEFAULT_APP_ID).strip()
     exchange_rate = request.form.get("exchange_rate", "").strip()
+    is_ajax = request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest"
 
     if not steam_id:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "保存汇率失败：缺少 steam_id"}), 400
         return redirect(url_for("accounts_page", error="保存汇率失败：缺少 steam_id"))
 
     rate = safe_float(exchange_rate, 0)
     if rate <= 0:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "保存汇率失败：汇率必须大于 0"}), 400
         return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="保存汇率失败：汇率必须大于 0"))
 
     save_account_exchange_rate(steam_id, app_id, rate)
+    if is_ajax:
+        return jsonify({"ok": True, "msg": "汇率保存成功", "exchange_rate": rate})
     return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, msg=f"汇率保存成功：1 USD = {rate:.4f}"))
 
 
