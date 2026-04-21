@@ -670,16 +670,73 @@ def update_inventory_snapshot_from_raw_items(steam_id, app_id, raw_items):
         return
 
     snapshot = load_inventory_snapshot(steam_id, app_id)
-    new_snapshot = {}
+    new_snapshot = dict(snapshot) if isinstance(snapshot, dict) else {}
+    now = now_str()
+    seen_asset_ids = set()
     for item in (raw_items or []):
         asset_id = str(item.get("assetId", "") or "").strip()
         if not asset_id:
             continue
+        seen_asset_ids.add(asset_id)
         entry = build_snapshot_entry_from_item(item, steam_id, app_id, existing_entry=snapshot.get(asset_id))
         if entry:
+            old = snapshot.get(asset_id, {}) if isinstance(snapshot.get(asset_id, {}), dict) else {}
+            first_seen_at = str(old.get("firstSeenAt", old.get("first_seen_at", "")) or "").strip()
+            if not first_seen_at:
+                first_seen_at = now
+            entry["firstSeenAt"] = first_seen_at
+            entry["first_seen_at"] = first_seen_at
+            entry["lastSeenAt"] = now
+            entry["last_seen_at"] = now
+            entry["inInventory"] = 1
+            entry["in_inventory"] = 1
             new_snapshot[asset_id] = entry
 
+    # 不再删除“本次不在库存”的旧词条：仅标记为不在库，保留历史记录
+    for aid, old_entry in snapshot.items():
+        if aid in seen_asset_ids:
+            continue
+        if not isinstance(old_entry, dict):
+            continue
+        keep = dict(old_entry)
+        keep["inInventory"] = 0
+        keep["in_inventory"] = 0
+        keep["lastMissingAt"] = now
+        keep["last_missing_at"] = now
+        if not str(keep.get("firstSeenAt", keep.get("first_seen_at", "")) or "").strip():
+            keep["firstSeenAt"] = now
+            keep["first_seen_at"] = now
+        if not str(keep.get("lastSeenAt", keep.get("last_seen_at", "")) or "").strip():
+            keep["lastSeenAt"] = now
+            keep["last_seen_at"] = now
+        new_snapshot[aid] = keep
+
     save_inventory_snapshot(steam_id, app_id, new_snapshot)
+
+
+def mark_snapshot_all_not_in_inventory(steam_id, app_id):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    if not steam_id or not app_id:
+        return
+    snapshot = load_inventory_snapshot(steam_id, app_id)
+    if not isinstance(snapshot, dict) or not snapshot:
+        return
+    now = now_str()
+    for aid, entry in snapshot.items():
+        if not isinstance(entry, dict):
+            continue
+        entry["inInventory"] = 0
+        entry["in_inventory"] = 0
+        entry["lastMissingAt"] = now
+        entry["last_missing_at"] = now
+        if not str(entry.get("firstSeenAt", entry.get("first_seen_at", "")) or "").strip():
+            entry["firstSeenAt"] = now
+            entry["first_seen_at"] = now
+        if not str(entry.get("lastSeenAt", entry.get("last_seen_at", "")) or "").strip():
+            entry["lastSeenAt"] = now
+            entry["last_seen_at"] = now
+    save_inventory_snapshot(steam_id, app_id, snapshot)
 
 
 def update_inventory_snapshot_cost(steam_id, app_id, asset_id, cost_price):
@@ -1224,7 +1281,7 @@ def sync_inventory_to_db(steam_id, app_id=DEFAULT_APP_ID):
 
             conn.commit()
             conn.close()
-            save_inventory_snapshot(steam_id, app_id, {})
+            mark_snapshot_all_not_in_inventory(steam_id, app_id)
             save_account_inventory_sync_status(
                 steam_id, app_id,
                 status="empty",
