@@ -461,6 +461,15 @@ def init_db():
         PRIMARY KEY (steam_id, app_id)
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS account_exchange_rates (
+        steam_id TEXT NOT NULL,
+        app_id TEXT NOT NULL,
+        exchange_rate REAL DEFAULT 0,
+        updated_at TEXT,
+        PRIMARY KEY (steam_id, app_id)
+    )
+    """)
 
     # 常用查询索引：利润分析页按 app_id / steam_id / 时间排序读取
     cur.execute("""
@@ -1933,6 +1942,46 @@ def save_item_purchase_price(steam_id, app_id, asset_id, purchase_price):
     update_inventory_snapshot_cost(steam_id, app_id, asset_id, normalized_price)
 
 
+def get_account_exchange_rate(steam_id, app_id):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    if not steam_id or not app_id:
+        return 0.0
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT exchange_rate
+    FROM account_exchange_rates
+    WHERE steam_id = ? AND app_id = ?
+    """, (steam_id, app_id))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return 0.0
+    return safe_float(row["exchange_rate"], 0.0)
+
+
+def save_account_exchange_rate(steam_id, app_id, exchange_rate):
+    steam_id = str(steam_id or "").strip()
+    app_id = str(app_id or "").strip()
+    rate = safe_float(exchange_rate, 0.0)
+    if not steam_id or not app_id:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO account_exchange_rates (steam_id, app_id, exchange_rate, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(steam_id, app_id) DO UPDATE SET
+        exchange_rate=excluded.exchange_rate,
+        updated_at=excluded.updated_at
+    """, (steam_id, app_id, rate, now_str()))
+    conn.commit()
+    conn.close()
+
+
 def apply_group_price_to_items(steam_id, app_id, group_name, price):
     conn = get_conn()
     cur = conn.cursor()
@@ -3269,6 +3318,24 @@ INVENTORY_TEMPLATE = """
         {% endif %}
     </div>
 
+    <div class="sync-panel" style="padding:14px 18px;">
+        <div class="sync-head" style="margin-bottom:8px;">
+            <div class="sync-title" style="font-size:16px;">该账号汇率设置（用于美金成本自动换算）</div>
+        </div>
+        <form method="post" action="/save_exchange_rate" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <input type="hidden" name="steam_id" value="{{ steam_id }}">
+            <input type="hidden" name="app_id" value="{{ app_id }}">
+            <input class="compact-input" type="number" step="0.0001" min="0" name="exchange_rate"
+                   value="{{ '%.4f'|format(exchange_rate or 0) }}" style="max-width:220px;"
+                   placeholder="例如 5.0000">
+            <button class="save-btn" type="submit">保存账号汇率</button>
+            <div class="sync-note" style="margin-top:0;">
+                当前汇率：{% if exchange_rate and exchange_rate > 0 %}1 USD = {{ "%.4f"|format(exchange_rate) }}{% else %}未设置{% endif %}
+            </div>
+        </form>
+        <div class="sync-note">填写单品时可输入“美金价格”，系统将自动按“汇率 × 美金”计算并保存人民币成本。</div>
+    </div>
+
     <div class="toggle-bar">
         <a class="toggle-btn {{ 'active' if view_mode == 'summary' else '' }}"
             href="/inventory/{{ steam_id }}?view=summary&inventory_filter={{ inventory_filter }}">按名称汇总</a>
@@ -3487,6 +3554,8 @@ INVENTORY_TEMPLATE = """
                             <input type="hidden" name="return_name" value="{{ selected_name or '' }}">
                             <input class="compact-input" type="number" step="0.01" name="purchase_price"
                                    value="{{ "%.2f"|format(item.purchase_price) }}">
+                            <input class="compact-input" type="number" step="0.01" name="usd_price"
+                                   placeholder="美金价格（可选）">
                             <button class="save-btn" type="submit">保存成本价</button>
                         </form>
 
@@ -3627,6 +3696,7 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
 
         const submitBtn = form.querySelector('button[type="submit"]');
         const priceInput = form.querySelector('input[name="purchase_price"]');
+        const usdInput = form.querySelector('input[name="usd_price"]');
         const prevLabel = submitBtn ? submitBtn.textContent : "";
 
         if (submitBtn) {
@@ -3648,7 +3718,10 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
             if (submitBtn) submitBtn.textContent = "已保存";
             const card = form.closest(".detail-row");
             const priceBox = card ? card.querySelector(".num-box") : null;
-            const v = Number(priceInput ? priceInput.value : "0");
+            const saved = Number((data && data.saved_purchase_price != null) ? data.saved_purchase_price : (priceInput ? priceInput.value : "0"));
+            const v = Number.isNaN(saved) ? 0 : saved;
+            if (priceInput) priceInput.value = v.toFixed(2);
+            if (usdInput) usdInput.value = "";
             if (priceBox && !Number.isNaN(v)) {
                 priceBox.textContent = "¥ " + v.toFixed(2);
             }
@@ -4789,6 +4862,7 @@ def inventory_page(steam_id):
 
     sync_status = get_sync_state()
     account_sync_status = get_account_inventory_sync_status(steam_id, app_id)
+    exchange_rate = get_account_exchange_rate(steam_id, app_id)
 
     items = get_inventory_from_db(steam_id, app_id=app_id)
 
@@ -4832,7 +4906,8 @@ def inventory_page(steam_id):
         total_market_value=total_market_value,
         total_cost=total_cost,
         sync_status=sync_status,
-        account_sync_status=account_sync_status
+        account_sync_status=account_sync_status,
+        exchange_rate=exchange_rate
     )
 
 @app.route("/sync/inventory/<steam_id>")
@@ -4883,6 +4958,7 @@ def save_item_price_route():
     app_id = request.form.get("app_id", DEFAULT_APP_ID).strip()
     asset_id = request.form.get("asset_id", "").strip()
     purchase_price = request.form.get("purchase_price", "0").strip()
+    usd_price = request.form.get("usd_price", "").strip()
     return_name = request.form.get("return_name", "").strip()
     return_all = request.form.get("return_all", "").strip()
     inventory_filter = request.form.get("inventory_filter", "all").strip()
@@ -4896,10 +4972,33 @@ def save_item_price_route():
             return jsonify({"ok": False, "error": "保存单品成本价失败：缺少必要参数"}), 400
         return redirect(url_for("accounts_page", error="保存单品成本价失败：缺少必要参数"))
 
-    save_item_purchase_price(steam_id, app_id, asset_id, purchase_price)
+    final_purchase_price = safe_float(purchase_price, 0)
+    used_usd_price = safe_float(usd_price, 0)
+    used_exchange_rate = 0.0
+    if usd_price != "":
+        if used_usd_price <= 0:
+            if is_ajax:
+                return jsonify({"ok": False, "error": "美金价格必须大于 0"}), 400
+            return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="保存失败：美金价格必须大于 0"))
+
+        used_exchange_rate = get_account_exchange_rate(steam_id, app_id)
+        if used_exchange_rate <= 0:
+            if is_ajax:
+                return jsonify({"ok": False, "error": "请先为该账号设置有效汇率"}), 400
+            return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="保存失败：请先设置该账号汇率"))
+
+        final_purchase_price = round(used_exchange_rate * used_usd_price, 2)
+
+    save_item_purchase_price(steam_id, app_id, asset_id, final_purchase_price)
 
     if is_ajax:
-        return jsonify({"ok": True, "msg": "单品购入成本价保存成功"})
+        return jsonify({
+            "ok": True,
+            "msg": "单品购入成本价保存成功",
+            "saved_purchase_price": final_purchase_price,
+            "used_usd_price": used_usd_price if usd_price != "" else None,
+            "used_exchange_rate": used_exchange_rate if usd_price != "" else None
+        })
 
     if return_all:
         return redirect(url_for(
@@ -4908,7 +5007,7 @@ def save_item_price_route():
             inventory_filter=inventory_filter,
             q=keyword,
             steam_id=steam_id_filter,
-            msg="单品购入成本价保存成功"
+            msg=f"单品购入成本价保存成功：{final_purchase_price:.2f}"
         ))
 
     if return_name:
@@ -4918,7 +5017,7 @@ def save_item_price_route():
             appId=app_id,
             view="detail",
             name=return_name,
-            msg="单品购入成本价保存成功"
+            msg=f"单品购入成本价保存成功：{final_purchase_price:.2f}"
         ))
 
     return redirect(url_for(
@@ -4926,8 +5025,25 @@ def save_item_price_route():
         steam_id=steam_id,
         appId=app_id,
         view="detail",
-        msg="单品购入成本价保存成功"
+        msg=f"单品购入成本价保存成功：{final_purchase_price:.2f}"
     ))
+
+
+@app.route("/save_exchange_rate", methods=["POST"])
+def save_exchange_rate_route():
+    steam_id = request.form.get("steam_id", "").strip()
+    app_id = request.form.get("app_id", DEFAULT_APP_ID).strip()
+    exchange_rate = request.form.get("exchange_rate", "").strip()
+
+    if not steam_id:
+        return redirect(url_for("accounts_page", error="保存汇率失败：缺少 steam_id"))
+
+    rate = safe_float(exchange_rate, 0)
+    if rate <= 0:
+        return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="保存汇率失败：汇率必须大于 0"))
+
+    save_account_exchange_rate(steam_id, app_id, rate)
+    return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, msg=f"汇率保存成功：1 USD = {rate:.4f}"))
 
 
 @app.route("/sell_item", methods=["POST"])
