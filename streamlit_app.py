@@ -76,6 +76,8 @@ PROFIT_SYNC_LOCK = threading.Lock()
 # 利润汇总缓存：按 app_id + 查询条件 + 时间窗口缓存 60 秒
 PROFIT_SUMMARY_CACHE = {}
 PROFIT_SUMMARY_CACHE_LOCK = threading.Lock()
+DAILY_TREND_CACHE = {}
+DAILY_TREND_CACHE_LOCK = threading.Lock()
 
 
 def get_sync_state():
@@ -316,6 +318,8 @@ def reset_profit_sync_state(app_id=DEFAULT_APP_ID):
 def clear_profit_summary_cache():
     with PROFIT_SUMMARY_CACHE_LOCK:
         PROFIT_SUMMARY_CACHE.clear()
+    with DAILY_TREND_CACHE_LOCK:
+        DAILY_TREND_CACHE.clear()
 
 
 
@@ -1953,7 +1957,7 @@ def get_inventory_item_for_sale(item_key, steam_id=None, app_id=DEFAULT_APP_ID):
     return dict(row) if row else None
 
 
-def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page=1, page_size=100):
+def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page=1, page_size=100, use_cached_image=False):
     conn = get_conn()
     cur = conn.cursor()
 
@@ -2123,6 +2127,10 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
                 account_cache[resolved_steam_id] = lookup_account_name(resolved_steam_id)
             nickname, username = account_cache[resolved_steam_id]
 
+        image_url = row.get("image_url", "")
+        if use_cached_image:
+            image_url = cache_image_and_get_local_url(image_url)
+
         record = {
             "order_id": str(row.get("order_id", "") or ""),
             "steam_id": resolved_steam_id,
@@ -2130,7 +2138,7 @@ def get_profit_rows_from_db(app_id=DEFAULT_APP_ID, keyword="", steam_id="", page
             "app_id": str(row.get("app_id", "") or ""),
             "name": item_name,
             "market_hash_name": row.get("market_hash_name", ""),
-            "image_url": cache_image_and_get_local_url(row.get("image_url", "")),
+            "image_url": image_url,
             "order_price": order_price,
             "order_status": int(row.get("order_status", 0) or 0),
             "status_name": row.get("status_name", ""),
@@ -2243,7 +2251,8 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
 
-    daily = defaultdict(float)
+    safe_days = max(1, int(days or 14))
+    daily = defaultdict(lambda: {"profit": 0.0, "count": 0})
     resolved_cache = {}
     item_cost_cache = {}
     inv_cost_cache = {}
@@ -2289,11 +2298,20 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         if ts > 10**12:
             ts = ts / 1000.0
         day_key = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-        daily[day_key] += profit
+        daily[day_key]["profit"] += profit
+        daily[day_key]["count"] += 1
 
     ordered = sorted(daily.items(), key=lambda x: x[0])
-    ordered = ordered[-max(1, int(days)):]
-    return [{"day": d[5:], "profit": round(v, 2)} for d, v in ordered]
+    ordered = ordered[-safe_days:]
+    return [
+        {
+            "date": d,
+            "day": d[5:],
+            "profit": round(v["profit"], 2),
+            "count": int(v["count"]),
+        }
+        for d, v in ordered
+    ]
 
 
 def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=200):
@@ -2506,6 +2524,25 @@ def get_profit_summary_cached(rows, app_id, steam_id, keyword, page, page_size):
     with PROFIT_SUMMARY_CACHE_LOCK:
         PROFIT_SUMMARY_CACHE[cache_key] = summary
     return summary
+
+
+def get_daily_profit_trend_cached(app_id, steam_id, keyword, days=14):
+    window_bucket = int(time.time() // 60)
+    cache_key = (str(app_id), str(steam_id or ""), str(keyword or ""), int(days or 14), window_bucket)
+    with DAILY_TREND_CACHE_LOCK:
+        cached = DAILY_TREND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = get_daily_profit_chart_data_from_db(
+        app_id=app_id,
+        keyword=keyword,
+        steam_id=steam_id,
+        days=days
+    )
+    with DAILY_TREND_CACHE_LOCK:
+        DAILY_TREND_CACHE[cache_key] = data
+    return data
 
 
 def build_daily_profit_chart_data(rows, days=14):
@@ -4089,12 +4126,34 @@ PROFIT_ANALYSIS_TEMPLATE = """
         }
         .pager-info { color: #8ca3c7; font-size: 13px; }
         .chart-wrap { margin: 8px 0 24px 0; background:#121c2f; border:1px solid #25344c; border-radius:16px; padding:14px; }
-        .chart-bars { display:flex; align-items:flex-end; gap:8px; min-height:180px; }
-        .bar-col { flex:1; min-width:30px; text-align:center; }
-        .bar { width:100%; border-radius:8px 8px 0 0; background:#2563eb; }
-        .bar.neg { background:#b91c1c; }
-        .bar-label { margin-top:6px; color:#8ca3c7; font-size:11px; }
-        .bar-value { color:#e5eefc; font-size:11px; margin-top:4px; }
+        .chart-desc { color:#8ca3c7; font-size:12px; margin-bottom:10px; }
+        .profit-calendar { display:grid; grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); gap:10px; }
+        .calendar-cell {
+            border: 1px solid #30465f;
+            border-radius: 12px;
+            min-height: 84px;
+            background: #0f1727;
+            padding: 8px;
+            cursor: pointer;
+            transition: transform .12s ease, border-color .12s ease;
+        }
+        .calendar-cell:hover { transform: translateY(-2px); border-color: #5d7ea6; }
+        .calendar-cell.active { border-color: #7aa2ff; box-shadow: 0 0 0 1px rgba(122,162,255,.35) inset; }
+        .cell-date { color:#dce9ff; font-size:12px; font-weight:700; }
+        .cell-profit { margin-top:6px; font-size:13px; font-weight:800; }
+        .cell-orders { margin-top:4px; color:#8ca3c7; font-size:11px; }
+        .profit-detail {
+            margin-top: 12px;
+            border:1px solid #30465f;
+            border-radius: 12px;
+            padding: 10px 12px;
+            background: #0f1727;
+            display:grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap:10px;
+        }
+        .detail-k { color:#8ca3c7; font-size:12px; }
+        .detail-v { color:#f8fbff; font-size:16px; font-weight:800; margin-top:4px; }
 
         @media (max-width: 1280px) {
             .order-head, .order-row,
@@ -4171,7 +4230,9 @@ PROFIT_ANALYSIS_TEMPLATE = """
     <div class="section">
         <div class="section-title">近 14 天利润趋势（仅统计已设置成本价）</div>
         <div class="chart-wrap">
-            <div id="dailyProfitBars" class="chart-bars"></div>
+            <div class="chart-desc">点击任意日期可查看当日利润与订单数；颜色越亮代表绝对利润越高。</div>
+            <div id="dailyProfitCalendar" class="profit-calendar"></div>
+            <div id="dailyProfitDetail" class="profit-detail" style="display:none;"></div>
         </div>
     </div>
 
@@ -4342,27 +4403,82 @@ async function refreshProfitSyncStatus() {
         console.log('refreshProfitSyncStatus failed', e);
     }
 }
-function renderDailyProfitBars() {
-    const container = document.getElementById('dailyProfitBars');
-    if (!container) return;
-    const data = {{ daily_profit_chart_json|safe }};
+function colorByProfit(value, maxAbs) {
+    if (maxAbs <= 0) return 'rgba(96,165,250,0.12)';
+    const ratio = Math.min(Math.abs(value || 0) / maxAbs, 1);
+    if (value >= 0) {
+        return `rgba(34,197,94,${0.18 + ratio * 0.55})`;
+    }
+    return `rgba(239,68,68,${0.18 + ratio * 0.55})`;
+}
+
+function renderDailyProfitCalendar(data) {
+    const calendar = document.getElementById('dailyProfitCalendar');
+    const detail = document.getElementById('dailyProfitDetail');
+    if (!calendar || !detail) return;
+
     if (!Array.isArray(data) || data.length === 0) {
-        container.innerHTML = '<div class="subtext">暂无可视化数据（可能因成本价未设置）</div>';
+        calendar.innerHTML = '<div class="subtext">暂无可视化数据（可能因成本价未设置）</div>';
+        detail.style.display = 'none';
         return;
     }
+
     const maxAbs = Math.max(...data.map(x => Math.abs(Number(x.profit || 0))), 1);
-    container.innerHTML = data.map(x => {
-        const v = Number(x.profit || 0);
-        const h = Math.max(6, Math.round((Math.abs(v) / maxAbs) * 150));
-        const cls = v >= 0 ? 'bar' : 'bar neg';
-        return `<div class="bar-col">
-            <div class="${cls}" style="height:${h}px"></div>
-            <div class="bar-value">${v.toFixed(2)}</div>
-            <div class="bar-label">${x.day}</div>
-        </div>`;
+    calendar.innerHTML = data.map((x, idx) => {
+        const profit = Number(x.profit || 0);
+        const date = x.date || x.day || '';
+        return `<button class="calendar-cell ${idx === data.length - 1 ? 'active' : ''}" data-date="${date}" data-profit="${profit}" data-count="${Number(x.count || 0)}" style="background:${colorByProfit(profit, maxAbs)};">
+            <div class="cell-date">${date}</div>
+            <div class="cell-profit ${profit >= 0 ? 'profit-plus' : 'profit-minus'}">¥ ${profit.toFixed(2)}</div>
+            <div class="cell-orders">订单 ${Number(x.count || 0)} 笔</div>
+        </button>`;
     }).join('');
+
+    const drawDetail = (date, profit, count) => {
+        detail.style.display = 'grid';
+        detail.innerHTML = `
+            <div><div class="detail-k">日期</div><div class="detail-v">${date}</div></div>
+            <div><div class="detail-k">当日利润</div><div class="detail-v ${profit >= 0 ? 'profit-plus' : 'profit-minus'}">¥ ${profit.toFixed(2)}</div></div>
+            <div><div class="detail-k">计入利润订单数</div><div class="detail-v">${count}</div></div>
+        `;
+    };
+
+    calendar.querySelectorAll('.calendar-cell').forEach(btn => {
+        btn.addEventListener('click', () => {
+            calendar.querySelectorAll('.calendar-cell').forEach(x => x.classList.remove('active'));
+            btn.classList.add('active');
+            drawDetail(
+                btn.getAttribute('data-date') || '-',
+                Number(btn.getAttribute('data-profit') || 0),
+                Number(btn.getAttribute('data-count') || 0)
+            );
+        });
+    });
+
+    const defaultNode = calendar.querySelector('.calendar-cell.active') || calendar.querySelector('.calendar-cell');
+    if (defaultNode) defaultNode.click();
 }
-renderDailyProfitBars();
+
+async function loadDailyProfitTrend() {
+    const calendar = document.getElementById('dailyProfitCalendar');
+    try {
+        const resp = await fetch('/api/profit_daily_trend?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&days=14');
+        if (!resp.ok) throw new Error('daily trend fetch failed');
+        const payload = await resp.json();
+        renderDailyProfitCalendar(Array.isArray(payload.data) ? payload.data : []);
+    } catch (e) {
+        if (calendar) {
+            calendar.innerHTML = '<div class="subtext">趋势加载失败，请稍后刷新重试。</div>';
+        }
+        console.log('loadDailyProfitTrend failed', e);
+    }
+}
+
+const initialDailyProfitData = {{ daily_profit_chart_json|safe }};
+renderDailyProfitCalendar(Array.isArray(initialDailyProfitData) ? initialDailyProfitData : []);
+if (!Array.isArray(initialDailyProfitData) || initialDailyProfitData.length === 0) {
+    loadDailyProfitTrend();
+}
 refreshProfitSyncStatus();
 setInterval(refreshProfitSyncStatus, 2000);
 </script>
@@ -4552,12 +4668,33 @@ def sync_profit_status_api():
     return jsonify(get_profit_sync_state())
 
 
+@app.route("/api/profit_daily_trend")
+def profit_daily_trend_api():
+    app_id = request.args.get("appId", DEFAULT_APP_ID)
+    keyword = request.args.get("q", "").strip()
+    selected_steam_id = request.args.get("steam_id", "").strip()
+    days = request.args.get("days", "14").strip()
+    try:
+        safe_days = min(max(int(days or 14), 1), 60)
+    except Exception:
+        safe_days = 14
+
+    data = get_daily_profit_trend_cached(
+        app_id=app_id,
+        steam_id=selected_steam_id,
+        keyword=keyword,
+        days=safe_days
+    )
+    return jsonify({"data": data, "days": safe_days})
+
+
 @app.route("/profit_analysis")
 def profit_analysis_page():
     profit_sync_status = get_profit_sync_state()
     app_id = request.args.get("appId", DEFAULT_APP_ID)
     keyword = request.args.get("q", "").strip()
     selected_steam_id = request.args.get("steam_id", "").strip()
+    use_cached_image = request.args.get("img_cache", "").strip() == "1"
     page = request.args.get("page", "1")
     refresh = request.args.get("refresh", "").strip() == "1"
     msg = request.args.get("msg", "")
@@ -4578,6 +4715,13 @@ def profit_analysis_page():
         page_size = int(cache_obj.get("page_size", safe_page_size) or safe_page_size)
         summary = cache_obj.get("summary", {}) or build_profit_summary(profit_rows)
         daily_profit_chart = cache_obj.get("daily_profit_chart", []) or []
+        if not daily_profit_chart:
+            daily_profit_chart = get_daily_profit_trend_cached(
+                app_id=app_id,
+                steam_id=selected_steam_id,
+                keyword=keyword,
+                days=14
+            )
         total_pages = int(cache_obj.get("total_pages", 1) or 1)
         from_cache = True
     else:
@@ -4586,13 +4730,14 @@ def profit_analysis_page():
             keyword=keyword,
             steam_id=selected_steam_id,
             page=safe_page,
-            page_size=safe_page_size
+            page_size=safe_page_size,
+            use_cached_image=use_cached_image
         )
         summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
-        daily_profit_chart = get_daily_profit_chart_data_from_db(
+        daily_profit_chart = get_daily_profit_trend_cached(
             app_id=app_id,
-            keyword=keyword,
             steam_id=selected_steam_id,
+            keyword=keyword,
             days=14
         )
         total_pages = max((total_count + page_size - 1) // page_size, 1)
