@@ -1896,7 +1896,9 @@ def group_inventory_by_name(items, steam_id, app_id):
             style_summary += " ..."
 
         default_purchase_price = get_group_default_purchase_price(steam_id, app_id, name)
-        total_cost = default_purchase_price * count
+        item_cost_total = sum(safe_float(x.get("purchase_price", 0), 0) for x in group_items)
+        # 若未设置分组默认成本，则回退为单品成本汇总，保证“所有库存”和“单账号”口径一致。
+        total_cost = default_purchase_price * count if default_purchase_price > 0 else item_cost_total
         total_profit = total_market_value - total_cost
 
         on_sale_count = sum(1 for x in group_items if int(x.get("status", 0)) == 1)
@@ -3225,7 +3227,7 @@ INVENTORY_TEMPLATE = """
 
                     <div>
                         <div class="num-box">¥ {{ "%.2f"|format(row.total_cost) }}</div>
-                        <div class="small">默认成本 × 数量</div>
+                        <div class="small">成本合计（默认成本或单品成本）</div>
                     </div>
 
                     <div>
