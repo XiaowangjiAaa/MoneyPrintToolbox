@@ -4363,11 +4363,8 @@ function renderDailyProfitCalendar(data) {
 
 async function loadDailyProfitTrend() {
     const calendar = document.getElementById('dailyProfitCalendar');
-    if (calendar) {
-        calendar.innerHTML = '<div class="subtext">趋势加载中...</div>';
-    }
     try {
-        const resp = await fetch('/api/profit_daily_trend?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&days=14', { cache: 'no-store' });
+        const resp = await fetch('/api/profit_daily_trend?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&days=14');
         if (!resp.ok) throw new Error('daily trend fetch failed');
         const payload = await resp.json();
         renderDailyProfitCalendar(Array.isArray(payload.data) ? payload.data : []);
@@ -4379,7 +4376,11 @@ async function loadDailyProfitTrend() {
     }
 }
 
-loadDailyProfitTrend();
+const initialDailyProfitData = {{ daily_profit_chart_json|safe }};
+renderDailyProfitCalendar(Array.isArray(initialDailyProfitData) ? initialDailyProfitData : []);
+if (!Array.isArray(initialDailyProfitData) || initialDailyProfitData.length === 0) {
+    loadDailyProfitTrend();
+}
 refreshProfitSyncStatus();
 setInterval(refreshProfitSyncStatus, 2000);
 </script>
@@ -4615,6 +4616,14 @@ def profit_analysis_page():
         page = int(cache_obj.get("page", safe_page) or safe_page)
         page_size = int(cache_obj.get("page_size", safe_page_size) or safe_page_size)
         summary = cache_obj.get("summary", {}) or build_profit_summary(profit_rows)
+        daily_profit_chart = cache_obj.get("daily_profit_chart", []) or []
+        if not daily_profit_chart:
+            daily_profit_chart = get_daily_profit_trend_cached(
+                app_id=app_id,
+                steam_id=selected_steam_id,
+                keyword=keyword,
+                days=14
+            )
         total_pages = int(cache_obj.get("total_pages", 1) or 1)
         from_cache = True
     else:
@@ -4627,6 +4636,12 @@ def profit_analysis_page():
             use_cached_image=use_cached_image
         )
         summary = get_profit_summary_cached(profit_rows, app_id, selected_steam_id, keyword, page, page_size)
+        daily_profit_chart = get_daily_profit_trend_cached(
+            app_id=app_id,
+            steam_id=selected_steam_id,
+            keyword=keyword,
+            days=14
+        )
         total_pages = max((total_count + page_size - 1) // page_size, 1)
         save_profit_analysis_cache(
             app_id, keyword, selected_steam_id, page, page_size,
@@ -4636,6 +4651,7 @@ def profit_analysis_page():
                 "page": page,
                 "page_size": page_size,
                 "summary": summary,
+                "daily_profit_chart": daily_profit_chart,
                 "total_pages": total_pages,
             }
         )
@@ -4652,6 +4668,7 @@ def profit_analysis_page():
         page_size=page_size,
         total_count=total_count,
         total_pages=total_pages,
+        daily_profit_chart_json=json.dumps(daily_profit_chart, ensure_ascii=False),
         msg=(msg + ("（本页使用本地缓存加速）" if from_cache and not msg else ("本页使用本地缓存加速" if from_cache else ""))),
         error=error,
         profit_sync_status=profit_sync_status
