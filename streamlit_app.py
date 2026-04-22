@@ -3512,6 +3512,54 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
         }
     });
 });
+
+// 出售改为异步提交，避免整页刷新后回到顶部。
+document.querySelectorAll(".sell-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "上架中...";
+        }
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "上架失败");
+            }
+
+            if (submitBtn) submitBtn.textContent = "已上架";
+
+            const row = form.closest(".detail-row");
+            const status = row ? row.querySelector(".status-tradable, .status-not-tradable, .status-on-sale") : null;
+            if (status) {
+                status.className = "status-on-sale";
+                status.textContent = "在售中";
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "出售";
+                }, 1200);
+            }
+        }
+    });
+});
 </script>
 </body>
 </html>
@@ -3801,6 +3849,8 @@ ALL_INVENTORY_TEMPLATE = """
                         <input type="hidden" name="item_key" value="{{ item.item_key }}">
                         <input type="hidden" name="return_all" value="1">
                         <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
+                        <input type="hidden" name="q" value="{{ keyword }}">
+                        <input type="hidden" name="steam_id_filter" value="{{ selected_steam_id }}">
                         <input class="compact-input" type="number" step="0.01" name="sale_price"
                                value="{{ "%.2f"|format(item.price) }}" placeholder="上架价格">
                         <input class="compact-input" type="text" name="sale_description" placeholder="描述（可空）">
@@ -3871,6 +3921,54 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
                 setTimeout(() => {
                     submitBtn.textContent = prevLabel || "保存成本价";
                 }, 900);
+            }
+        }
+    });
+});
+
+// 出售改为异步提交，避免整页刷新后回到顶部。
+document.querySelectorAll(".sell-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "上架中...";
+        }
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "上架失败");
+            }
+
+            if (submitBtn) submitBtn.textContent = "已上架";
+
+            const row = form.closest(".row");
+            const status = row ? row.querySelector(".status-tradable, .status-not-tradable, .status-on-sale") : null;
+            if (status) {
+                status.className = "status-on-sale";
+                status.textContent = "在售中";
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "出售";
+                }, 1200);
             }
         }
     });
@@ -4779,12 +4877,19 @@ def sell_item_route():
     return_name = request.form.get("return_name", "").strip()
     return_all = request.form.get("return_all", "").strip()
     inventory_filter = request.form.get("inventory_filter", "all").strip()
+    keyword = request.form.get("q", "").strip()
+    steam_id_filter = request.form.get("steam_id_filter", "").strip()
+    is_ajax = request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest"
 
     if not item_key:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "上架失败：缺少 item_key"}), 400
         return redirect(url_for("accounts_page", error="上架失败：缺少 item_key"))
 
     item = get_inventory_item_for_sale(item_key=item_key, steam_id=steam_id if not return_all else None, app_id=app_id)
     if not item:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "上架失败：未找到库存记录"}), 404
         if return_all:
             return redirect(url_for("all_inventory_page", error="上架失败：未找到库存记录"))
         return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="上架失败：未找到库存记录"))
@@ -4793,6 +4898,8 @@ def sell_item_route():
     style_token = item.get("style_token", "")
 
     if not token or not style_token:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "上架失败：缺少 token 或 styleToken"}), 400
         if return_all:
             return redirect(url_for("all_inventory_page", error="上架失败：缺少 token 或 styleToken"))
         return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="上架失败：缺少 token 或 styleToken"))
@@ -4806,6 +4913,8 @@ def sell_item_route():
     )
 
     if error:
+        if is_ajax:
+            return jsonify({"ok": False, "error": f"上架失败：{error}"}), 400
         if return_all:
             return redirect(url_for("all_inventory_page", error=f"上架失败：{error}"))
         if return_name:
@@ -4845,9 +4954,17 @@ def sell_item_route():
     failed = result.get("failed", 0)
 
     msg = f"上架完成：成功 {succeed} 个，失败 {failed} 个"
+    if is_ajax:
+        return jsonify({"ok": True, "msg": msg, "succeed": succeed, "failed": failed})
 
     if return_all:
-        return redirect(url_for("all_inventory_page", inventory_filter=inventory_filter, msg=msg))
+        return redirect(url_for(
+            "all_inventory_page",
+            inventory_filter=inventory_filter,
+            q=keyword,
+            steam_id=steam_id_filter,
+            msg=msg
+        ))
 
     if return_name:
         return redirect(url_for(
