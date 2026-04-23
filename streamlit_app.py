@@ -3620,6 +3620,9 @@ ALL_INVENTORY_TEMPLATE = """
             gap: 12px;
             align-items: center;
         }
+        .merge-mode .head, .merge-mode .row {
+            grid-template-columns: 90px 2fr 0.8fr 1fr 1fr 1fr;
+        }
         .head {
             padding: 8px 14px;
             color: #8ca3c7;
@@ -3710,7 +3713,7 @@ ALL_INVENTORY_TEMPLATE = """
         }
     </style>
 </head>
-<body>
+<body class="{{ 'merge-mode' if merge_same else '' }}">
 <div class="container">
     <div class="topbar">
         <div>
@@ -3730,6 +3733,7 @@ ALL_INVENTORY_TEMPLATE = """
                     {% endfor %}
                 </select>
                 <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
+                <input type="hidden" name="merge_same" value="{{ '1' if merge_same else '0' }}">
                 <button class="btn" type="submit">搜索</button>
              </form>
              <a class="btn" href="/sync/all_inventory">同步所有账号库存</a>
@@ -3741,17 +3745,22 @@ ALL_INVENTORY_TEMPLATE = """
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
 
     <div class="toggle-bar" style="margin: 16px 0 20px 0;">
-        <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=all{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}{% if merge_same %}&merge_same=1{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'all' else '' }}">全部</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=on_sale{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=on_sale{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}{% if merge_same %}&merge_same=1{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'on_sale' else '' }}">在售中</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}{% if merge_same %}&merge_same=1{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'tradable' else '' }}">可交易</a>
 
-        <a class="btn" href="/all_inventory?inventory_filter=not_tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}"
+        <a class="btn" href="/all_inventory?inventory_filter=not_tradable{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}{% if merge_same %}&merge_same=1{% endif %}"
            style="{{ 'background:#0f9d58;' if inventory_filter == 'not_tradable' else '' }}">不可交易</a>
+
+        <a class="btn" href="/all_inventory?inventory_filter={{ inventory_filter }}{% if keyword %}&q={{ keyword|urlencode }}{% endif %}{% if selected_steam_id %}&steam_id={{ selected_steam_id|urlencode }}{% endif %}{% if merge_same %}&merge_same=0{% else %}&merge_same=1{% endif %}"
+           style="{{ 'background:#0f9d58;' if merge_same else '' }}">
+            {{ '取消合并显示' if merge_same else '合并相同物品' }}
+        </a>
     </div>
 
     <div class="stats">
@@ -3759,14 +3768,16 @@ ALL_INVENTORY_TEMPLATE = """
             <div class="stat-label">总件数</div>
             <div class="stat-value">{{ total_count }}</div>
         </div>
-        <div class="stat">
-            <div class="stat-label">在售中数量</div>
-            <div class="stat-value">{{ on_sale_count }}</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">可交易数量</div>
-            <div class="stat-value">{{ tradable_count }}</div>
-        </div>
+        {% if not merge_same %}
+            <div class="stat">
+                <div class="stat-label">在售中数量</div>
+                <div class="stat-value">{{ on_sale_count }}</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">可交易数量</div>
+                <div class="stat-value">{{ tradable_count }}</div>
+            </div>
+        {% endif %}
         <div class="stat">
             <div class="stat-label">总市值</div>
             <div class="stat-value">{{ "%.2f"|format(total_market_value) }}</div>
@@ -3778,17 +3789,28 @@ ALL_INVENTORY_TEMPLATE = """
     </div>
 
     {% if items %}
-        <div class="head">
-            <div>图片</div>
-            <div>商品</div>
-            <div>账号</div>
-            <div>标识</div>
-            <div>市场价</div>
-            <div>成本价</div>
-            <div>利润</div>
-            <div>分类</div>
-            <div>出售</div>
-        </div>
+        {% if merge_same %}
+            <div class="head">
+                <div>图片</div>
+                <div>商品</div>
+                <div>数量</div>
+                <div>平均市场价</div>
+                <div>平均成本价</div>
+                <div>平均利润</div>
+            </div>
+        {% else %}
+            <div class="head">
+                <div>图片</div>
+                <div>商品</div>
+                <div>账号</div>
+                <div>标识</div>
+                <div>市场价</div>
+                <div>成本价</div>
+                <div>利润</div>
+                <div>分类</div>
+                <div>出售</div>
+            </div>
+        {% endif %}
 
         <div class="list">
             {% for item in items %}
@@ -3808,12 +3830,23 @@ ALL_INVENTORY_TEMPLATE = """
                     </div>
                 </div>
 
+                {% if merge_same %}
+                <div class="num">{{ item.quantity }}</div>
+                {% else %}
                 <div>
                     <div class="num">{{ item.nickname or '未命名账号' }}</div>
                     <div class="subtext">{{ item.username or '' }}</div>
                     <div class="subtext">{{ item.steam_id }}</div>
                 </div>
+                {% endif %}
 
+                {% if merge_same %}
+                <div class="num">¥ {{ "%.2f"|format(item.avg_price) }}</div>
+                <div class="num">¥ {{ "%.2f"|format(item.avg_purchase_price) }}</div>
+                <div class="{{ 'profit-plus' if item.avg_profit >= 0 else 'profit-minus' }}">
+                    ¥ {{ "%.2f"|format(item.avg_profit) }}
+                </div>
+                {% else %}
                 <div>
                     <div class="subtext">assetId: {{ item.asset_id }}</div>
                     {% if item.style_id %}
@@ -3884,6 +3917,7 @@ ALL_INVENTORY_TEMPLATE = """
                     </div>
                     {% endif %}
                 </div>
+                {% endif %}
             </div>
             {% endfor %}
         </div>
@@ -5053,6 +5087,7 @@ def all_inventory_page():
     keyword = request.args.get("q", "").strip().lower()
     selected_steam_id = request.args.get("steam_id", "").strip()
     inventory_filter = request.args.get("inventory_filter", "all").strip()
+    merge_same = request.args.get("merge_same", "0").strip() == "1"
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
 
@@ -5127,11 +5162,60 @@ def all_inventory_page():
 
     items = apply_inventory_filter(items, inventory_filter)
 
+    if merge_same:
+        grouped = {}
+        for item in items:
+            group_key = (
+                str(item.get("name") or "").strip().lower(),
+                str(item.get("short_name") or "").strip().lower(),
+                str(item.get("weapon_name") or "").strip().lower(),
+                str(item.get("exterior_name") or "").strip().lower(),
+                str(item.get("style_id") or "").strip().lower(),
+            )
+            if group_key not in grouped:
+                grouped[group_key] = {
+                    "name": item.get("name", ""),
+                    "short_name": item.get("short_name", ""),
+                    "image_url": item.get("image_url", ""),
+                    "weapon_name": item.get("weapon_name", ""),
+                    "exterior_name": item.get("exterior_name", ""),
+                    "style_id": item.get("style_id", ""),
+                    "quantity": 0,
+                    "total_price": 0.0,
+                    "total_purchase_price": 0.0,
+                }
+
+            grouped[group_key]["quantity"] += 1
+            grouped[group_key]["total_price"] += safe_float(item.get("price", 0), 0)
+            grouped[group_key]["total_purchase_price"] += safe_float(item.get("purchase_price", 0), 0)
+
+        merged_items = []
+        for group in grouped.values():
+            qty = max(int(group["quantity"]), 1)
+            avg_price = group["total_price"] / qty
+            avg_purchase_price = group["total_purchase_price"] / qty
+            merged_items.append({
+                **group,
+                "avg_price": avg_price,
+                "avg_purchase_price": avg_purchase_price,
+                "avg_profit": avg_price - avg_purchase_price,
+            })
+
+        items = sorted(
+            merged_items,
+            key=lambda x: (safe_float(x["avg_price"], 0), str(x.get("name", ""))),
+            reverse=True
+        )
+
     total_count = len(items)
-    on_sale_count = sum(1 for x in items if x["bucket"] == "on_sale")
-    tradable_count = sum(1 for x in items if x["bucket"] == "tradable")
-    total_market_value = sum(safe_float(x["price"], 0) for x in items)
-    total_cost = sum(safe_float(x["purchase_price"], 0) for x in items)
+    on_sale_count = 0 if merge_same else sum(1 for x in items if x["bucket"] == "on_sale")
+    tradable_count = 0 if merge_same else sum(1 for x in items if x["bucket"] == "tradable")
+    if merge_same:
+        total_market_value = sum(safe_float(x["total_price"], 0) for x in items)
+        total_cost = sum(safe_float(x["total_purchase_price"], 0) for x in items)
+    else:
+        total_market_value = sum(safe_float(x["price"], 0) for x in items)
+        total_cost = sum(safe_float(x["purchase_price"], 0) for x in items)
     accounts = get_all_accounts_from_db()
 
     return render_template_string(
@@ -5146,6 +5230,7 @@ def all_inventory_page():
         selected_steam_id=selected_steam_id,
         accounts=accounts,
         inventory_filter=inventory_filter,
+        merge_same=merge_same,
         msg=msg,
         error=error
     )
