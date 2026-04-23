@@ -6,7 +6,7 @@ import time
 import hashlib
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import threading
 import os
@@ -541,15 +541,15 @@ def ensure_profit_analysis_cache_dir():
         pass
 
 
-def get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size):
+def get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size, trend_days=14):
     ensure_profit_analysis_cache_dir()
-    raw = f"{app_id}|{keyword}|{steam_id}|{page}|{page_size}"
+    raw = f"{app_id}|{keyword}|{steam_id}|{page}|{page_size}|{trend_days}"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
     return os.path.join(PROFIT_ANALYSIS_CACHE_DIR, f"{digest}.json")
 
 
-def load_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, max_age_seconds=30):
-    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size)
+def load_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, trend_days=14, max_age_seconds=30):
+    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size, trend_days=trend_days)
     if not os.path.exists(path):
         return None
     try:
@@ -566,8 +566,8 @@ def load_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, max_a
         return None
 
 
-def save_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, payload):
-    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size)
+def save_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, trend_days, payload):
+    path = get_profit_analysis_cache_path(app_id, keyword, steam_id, page, page_size, trend_days=trend_days)
     body = {
         "cached_at_ts": time.time(),
         "cached_at": now_str(),
@@ -576,6 +576,7 @@ def save_profit_analysis_cache(app_id, keyword, steam_id, page, page_size, paylo
         "steam_id": steam_id or "",
         "page": int(page or 1),
         "page_size": int(page_size or 100),
+        "trend_days": int(trend_days or 14),
     }
     if isinstance(payload, dict):
         body.update(payload)
@@ -1896,7 +1897,9 @@ def group_inventory_by_name(items, steam_id, app_id):
             style_summary += " ..."
 
         default_purchase_price = get_group_default_purchase_price(steam_id, app_id, name)
-        total_cost = default_purchase_price * count
+        item_cost_total = sum(safe_float(x.get("purchase_price", 0), 0) for x in group_items)
+        # 若未设置分组默认成本，则回退为单品成本汇总，保证“所有库存”和“单账号”口径一致。
+        total_cost = default_purchase_price * count if default_purchase_price > 0 else item_cost_total
         total_profit = total_market_value - total_cost
 
         on_sale_count = sum(1 for x in group_items if int(x.get("status", 0)) == 1)
@@ -2291,9 +2294,17 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
         day_key = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
         daily[day_key] += profit
 
-    ordered = sorted(daily.items(), key=lambda x: x[0])
-    ordered = ordered[-max(1, int(days)):]
-    return [{"day": d[5:], "profit": round(v, 2)} for d, v in ordered]
+    safe_days = max(7, min(int(days or 14), 180))
+    today = datetime.utcnow().date()
+    result = []
+    for i in range(safe_days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        day_key = d.strftime("%Y-%m-%d")
+        result.append({
+            "day": day_key,
+            "profit": round(safe_float(daily.get(day_key, 0), 0), 2)
+        })
+    return result
 
 
 def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=200):
@@ -2439,11 +2450,12 @@ def get_profit_diagnostics_by_asset_id(asset_id, app_id=DEFAULT_APP_ID, limit=20
 
 
 def build_profit_summary(rows):
-    total_orders = len(rows)
     counted_rows = [x for x in rows if x.get("counted_in_profit")]
+    total_orders = len(counted_rows)
     total_revenue = sum(safe_float(x["order_price"], 0) for x in counted_rows)
     total_cost = sum(safe_float(x["cost_price"], 0) for x in counted_rows)
     total_profit = sum(safe_float(x["profit"], 0) for x in counted_rows)
+    profit_rate = (total_profit / total_cost * 100.0) if total_cost > 0 else 0.0
 
     by_name = defaultdict(lambda: {
         "name": "",
@@ -2485,9 +2497,11 @@ def build_profit_summary(rows):
 
     return {
         "total_orders": total_orders,
+        "raw_total_orders": len(rows),
         "total_revenue": total_revenue,
         "total_cost": total_cost,
         "total_profit": total_profit,
+        "profit_rate": profit_rate,
         "by_name_rows": by_name_rows,
         "by_account_rows": by_account_rows,
     }
@@ -3225,7 +3239,7 @@ INVENTORY_TEMPLATE = """
 
                     <div>
                         <div class="num-box">¥ {{ "%.2f"|format(row.total_cost) }}</div>
-                        <div class="small">默认成本 × 数量</div>
+                        <div class="small">成本合计（默认成本或单品成本）</div>
                     </div>
 
                     <div>
@@ -3508,6 +3522,54 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
                 setTimeout(() => {
                     submitBtn.textContent = prevLabel || "保存成本价";
                 }, 900);
+            }
+        }
+    });
+});
+
+// 出售改为异步提交，避免整页刷新后回到顶部。
+document.querySelectorAll(".sell-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "上架中...";
+        }
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "上架失败");
+            }
+
+            if (submitBtn) submitBtn.textContent = "已上架";
+
+            const row = form.closest(".detail-row");
+            const status = row ? row.querySelector(".status-tradable, .status-not-tradable, .status-on-sale") : null;
+            if (status) {
+                status.className = "status-on-sale";
+                status.textContent = "在售中";
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "出售";
+                }, 1200);
             }
         }
     });
@@ -3801,6 +3863,8 @@ ALL_INVENTORY_TEMPLATE = """
                         <input type="hidden" name="item_key" value="{{ item.item_key }}">
                         <input type="hidden" name="return_all" value="1">
                         <input type="hidden" name="inventory_filter" value="{{ inventory_filter }}">
+                        <input type="hidden" name="q" value="{{ keyword }}">
+                        <input type="hidden" name="steam_id_filter" value="{{ selected_steam_id }}">
                         <input class="compact-input" type="number" step="0.01" name="sale_price"
                                value="{{ "%.2f"|format(item.price) }}" placeholder="上架价格">
                         <input class="compact-input" type="text" name="sale_description" placeholder="描述（可空）">
@@ -3871,6 +3935,54 @@ document.querySelectorAll(".cost-save-form").forEach(form => {
                 setTimeout(() => {
                     submitBtn.textContent = prevLabel || "保存成本价";
                 }, 900);
+            }
+        }
+    });
+});
+
+// 出售改为异步提交，避免整页刷新后回到顶部。
+document.querySelectorAll(".sell-form").forEach(form => {
+    form.addEventListener("submit", async (event) => {
+        if (form.dataset.ajaxBypass === "1") return;
+        event.preventDefault();
+
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const prevLabel = submitBtn ? submitBtn.textContent : "";
+
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = "上架中...";
+        }
+
+        try {
+            const resp = await fetch(form.action, {
+                method: "POST",
+                body: new FormData(form),
+                headers: { "X-Requested-With": "XMLHttpRequest" }
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data || !data.ok) {
+                throw new Error((data && data.error) || "上架失败");
+            }
+
+            if (submitBtn) submitBtn.textContent = "已上架";
+
+            const row = form.closest(".row");
+            const status = row ? row.querySelector(".status-tradable, .status-not-tradable, .status-on-sale") : null;
+            if (status) {
+                status.className = "status-on-sale";
+                status.textContent = "在售中";
+            }
+        } catch (e) {
+            form.dataset.ajaxBypass = "1";
+            form.submit();
+            return;
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                setTimeout(() => {
+                    submitBtn.textContent = prevLabel || "出售";
+                }, 1200);
             }
         }
     });
@@ -3991,12 +4103,13 @@ PROFIT_ANALYSIS_TEMPLATE = """
         }
         .pager-info { color: #8ca3c7; font-size: 13px; }
         .chart-wrap { margin: 8px 0 24px 0; background:#121c2f; border:1px solid #25344c; border-radius:16px; padding:14px; }
-        .chart-bars { display:flex; align-items:flex-end; gap:8px; min-height:180px; }
-        .bar-col { flex:1; min-width:30px; text-align:center; }
-        .bar { width:100%; border-radius:8px 8px 0 0; background:#2563eb; }
-        .bar.neg { background:#b91c1c; }
-        .bar-label { margin-top:6px; color:#8ca3c7; font-size:11px; }
-        .bar-value { color:#e5eefc; font-size:11px; margin-top:4px; }
+        .calendar-head { display:grid; grid-template-columns: repeat(7, 1fr); gap:6px; margin-bottom:8px; }
+        .calendar-weekday { text-align:center; color:#8ca3c7; font-size:11px; }
+        .calendar-grid { display:grid; grid-template-columns: repeat(7, 1fr); gap:6px; }
+        .cal-cell { min-height:70px; border-radius:10px; border:1px solid #2b3b55; padding:6px; display:flex; flex-direction:column; justify-content:space-between; }
+        .cal-empty { background:transparent; border:1px dashed #24344d; }
+        .cal-date { font-size:11px; color:#c7d7f3; }
+        .cal-profit { font-size:12px; font-weight:700; }
 
         @media (max-width: 1280px) {
             .order-head, .order-row,
@@ -4026,11 +4139,16 @@ PROFIT_ANALYSIS_TEMPLATE = """
                     </option>
                     {% endfor %}
                 </select>
+                <select class="select" name="trend_days">
+                    <option value="14" {{ 'selected' if trend_days == 14 else '' }}>近 14 天</option>
+                    <option value="30" {{ 'selected' if trend_days == 30 else '' }}>近 30 天</option>
+                    <option value="90" {{ 'selected' if trend_days == 90 else '' }}>近 90 天</option>
+                </select>
                 <button class="btn" type="submit">筛选</button>
             </form>
 
             <a class="btn" href="/sync/profit_orders">同步利润订单</a>
-            <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page }}&refresh=1">刷新利润数据</a>
+            <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&trend_days={{ trend_days }}&page={{ page }}&refresh=1">刷新利润数据</a>
             <a class="btn" href="/profit_debug?appId={{ app_id }}">利润诊断</a>
             <a class="btn" href="/">返回主页面</a>
         </div>
@@ -4053,8 +4171,9 @@ PROFIT_ANALYSIS_TEMPLATE = """
 
     <div class="stats">
         <div class="stat">
-            <div class="stat-label">已完成订单数</div>
+            <div class="stat-label">已统计利润订单数</div>
             <div class="stat-value">{{ summary.total_orders }}</div>
+            <div class="subtext">总完成订单：{{ summary.raw_total_orders }}</div>
         </div>
         <div class="stat">
             <div class="stat-label">总成交额</div>
@@ -4068,12 +4187,21 @@ PROFIT_ANALYSIS_TEMPLATE = """
             <div class="stat-label">总利润</div>
             <div class="stat-value">{{ "%.2f"|format(summary.total_profit) }}</div>
         </div>
+        <div class="stat">
+            <div class="stat-label">利润率（利润/成本）</div>
+            <div class="stat-value">{{ "%.2f"|format(summary.profit_rate) }}%</div>
+        </div>
     </div>
 
     <div class="section">
-        <div class="section-title">近 14 天利润趋势（仅统计已设置成本价）</div>
+        <div class="section-title">近 {{ trend_days }} 天利润日历（仅统计已设置成本价）</div>
         <div class="chart-wrap">
-            <div id="dailyProfitBars" class="chart-bars"></div>
+            <div class="calendar-head">
+                <div class="calendar-weekday">一</div><div class="calendar-weekday">二</div><div class="calendar-weekday">三</div>
+                <div class="calendar-weekday">四</div><div class="calendar-weekday">五</div><div class="calendar-weekday">六</div>
+                <div class="calendar-weekday">日</div>
+            </div>
+            <div id="dailyProfitCalendar" class="calendar-grid"></div>
         </div>
     </div>
 
@@ -4153,10 +4281,10 @@ PROFIT_ANALYSIS_TEMPLATE = """
 
             <div class="pager">
                 {% if page > 1 %}
-                    <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page - 1 }}">上一页</a>
+                    <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&trend_days={{ trend_days }}&page={{ page - 1 }}">上一页</a>
                 {% endif %}
                 {% if page < total_pages %}
-                    <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&page={{ page + 1 }}">下一页</a>
+                    <a class="btn" href="/profit_analysis?appId={{ app_id }}&q={{ keyword|urlencode }}&steam_id={{ selected_steam_id|urlencode }}&trend_days={{ trend_days }}&page={{ page + 1 }}">下一页</a>
                 {% endif %}
                 <div class="pager-info">提示：分页能显著减少首屏卡顿，筛选后默认从第 1 页开始。</div>
             </div>
@@ -4244,27 +4372,49 @@ async function refreshProfitSyncStatus() {
         console.log('refreshProfitSyncStatus failed', e);
     }
 }
-function renderDailyProfitBars() {
-    const container = document.getElementById('dailyProfitBars');
+function renderDailyProfitCalendar() {
+    const container = document.getElementById('dailyProfitCalendar');
     if (!container) return;
     const data = {{ daily_profit_chart_json|safe }};
     if (!Array.isArray(data) || data.length === 0) {
         container.innerHTML = '<div class="subtext">暂无可视化数据（可能因成本价未设置）</div>';
         return;
     }
+    const firstDay = data[0] && data[0].day ? new Date(data[0].day + 'T00:00:00') : null;
+    if (!firstDay || Number.isNaN(firstDay.getTime())) {
+        container.innerHTML = '<div class="subtext">日期数据格式异常</div>';
+        return;
+    }
+    const mondayBased = (firstDay.getDay() + 6) % 7; // 周一=0
     const maxAbs = Math.max(...data.map(x => Math.abs(Number(x.profit || 0))), 1);
-    container.innerHTML = data.map(x => {
+    const cells = [];
+    for (let i = 0; i < mondayBased; i++) {
+        cells.push('<div class="cal-cell cal-empty"></div>');
+    }
+
+    data.forEach(x => {
         const v = Number(x.profit || 0);
-        const h = Math.max(6, Math.round((Math.abs(v) / maxAbs) * 150));
-        const cls = v >= 0 ? 'bar' : 'bar neg';
-        return `<div class="bar-col">
-            <div class="${cls}" style="height:${h}px"></div>
-            <div class="bar-value">${v.toFixed(2)}</div>
-            <div class="bar-label">${x.day}</div>
-        </div>`;
-    }).join('');
+        const d = (x.day || '').slice(5);
+        const ratio = Math.min(1, Math.abs(v) / maxAbs);
+        let bg = 'rgba(37,99,235,0.10)';
+        let color = '#dbeafe';
+        if (v > 0) {
+            bg = `rgba(16,185,129,${0.16 + ratio * 0.54})`;
+            color = '#d1fae5';
+        } else if (v < 0) {
+            bg = `rgba(239,68,68,${0.16 + ratio * 0.54})`;
+            color = '#fee2e2';
+        }
+        cells.push(
+            `<div class="cal-cell" style="background:${bg};">
+                <div class="cal-date">${d}</div>
+                <div class="cal-profit" style="color:${color};">${v.toFixed(2)}</div>
+            </div>`
+        );
+    });
+    container.innerHTML = cells.join('');
 }
-renderDailyProfitBars();
+renderDailyProfitCalendar();
 refreshProfitSyncStatus();
 setInterval(refreshProfitSyncStatus, 2000);
 </script>
@@ -4461,6 +4611,7 @@ def profit_analysis_page():
     keyword = request.args.get("q", "").strip()
     selected_steam_id = request.args.get("steam_id", "").strip()
     page = request.args.get("page", "1")
+    trend_days = request.args.get("trend_days", "14")
     refresh = request.args.get("refresh", "").strip() == "1"
     msg = request.args.get("msg", "")
     error = request.args.get("error", "")
@@ -4469,8 +4620,12 @@ def profit_analysis_page():
     accounts = get_all_accounts_from_db()
     safe_page = max(int(page or 1), 1)
     safe_page_size = 100
+    try:
+        safe_trend_days = max(7, min(int(trend_days or 14), 180))
+    except Exception:
+        safe_trend_days = 14
     cache_obj = None if refresh else load_profit_analysis_cache(
-        app_id, keyword, selected_steam_id, safe_page, safe_page_size, max_age_seconds=None
+        app_id, keyword, selected_steam_id, safe_page, safe_page_size, trend_days=safe_trend_days, max_age_seconds=None
     )
 
     if cache_obj and not profit_sync_status.get("running"):
@@ -4479,6 +4634,8 @@ def profit_analysis_page():
         page = int(cache_obj.get("page", safe_page) or safe_page)
         page_size = int(cache_obj.get("page_size", safe_page_size) or safe_page_size)
         summary = cache_obj.get("summary", {}) or build_profit_summary(profit_rows)
+        if "profit_rate" not in summary or "raw_total_orders" not in summary:
+            summary = build_profit_summary(profit_rows)
         daily_profit_chart = cache_obj.get("daily_profit_chart", []) or []
         total_pages = int(cache_obj.get("total_pages", 1) or 1)
         from_cache = True
@@ -4495,11 +4652,11 @@ def profit_analysis_page():
             app_id=app_id,
             keyword=keyword,
             steam_id=selected_steam_id,
-            days=14
+            days=safe_trend_days
         )
         total_pages = max((total_count + page_size - 1) // page_size, 1)
         save_profit_analysis_cache(
-            app_id, keyword, selected_steam_id, page, page_size,
+            app_id, keyword, selected_steam_id, page, page_size, safe_trend_days,
             {
                 "profit_rows": profit_rows,
                 "total_count": total_count,
@@ -4519,6 +4676,7 @@ def profit_analysis_page():
         app_id=app_id,
         keyword=keyword,
         selected_steam_id=selected_steam_id,
+        trend_days=safe_trend_days,
         page=page,
         page_size=page_size,
         total_count=total_count,
@@ -4779,12 +4937,19 @@ def sell_item_route():
     return_name = request.form.get("return_name", "").strip()
     return_all = request.form.get("return_all", "").strip()
     inventory_filter = request.form.get("inventory_filter", "all").strip()
+    keyword = request.form.get("q", "").strip()
+    steam_id_filter = request.form.get("steam_id_filter", "").strip()
+    is_ajax = request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest"
 
     if not item_key:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "上架失败：缺少 item_key"}), 400
         return redirect(url_for("accounts_page", error="上架失败：缺少 item_key"))
 
     item = get_inventory_item_for_sale(item_key=item_key, steam_id=steam_id if not return_all else None, app_id=app_id)
     if not item:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "上架失败：未找到库存记录"}), 404
         if return_all:
             return redirect(url_for("all_inventory_page", error="上架失败：未找到库存记录"))
         return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="上架失败：未找到库存记录"))
@@ -4793,6 +4958,8 @@ def sell_item_route():
     style_token = item.get("style_token", "")
 
     if not token or not style_token:
+        if is_ajax:
+            return jsonify({"ok": False, "error": "上架失败：缺少 token 或 styleToken"}), 400
         if return_all:
             return redirect(url_for("all_inventory_page", error="上架失败：缺少 token 或 styleToken"))
         return redirect(url_for("inventory_page", steam_id=steam_id, appId=app_id, error="上架失败：缺少 token 或 styleToken"))
@@ -4806,6 +4973,8 @@ def sell_item_route():
     )
 
     if error:
+        if is_ajax:
+            return jsonify({"ok": False, "error": f"上架失败：{error}"}), 400
         if return_all:
             return redirect(url_for("all_inventory_page", error=f"上架失败：{error}"))
         if return_name:
@@ -4845,9 +5014,17 @@ def sell_item_route():
     failed = result.get("failed", 0)
 
     msg = f"上架完成：成功 {succeed} 个，失败 {failed} 个"
+    if is_ajax:
+        return jsonify({"ok": True, "msg": msg, "succeed": succeed, "failed": failed})
 
     if return_all:
-        return redirect(url_for("all_inventory_page", inventory_filter=inventory_filter, msg=msg))
+        return redirect(url_for(
+            "all_inventory_page",
+            inventory_filter=inventory_filter,
+            q=keyword,
+            steam_id=steam_id_filter,
+            msg=msg
+        ))
 
     if return_name:
         return redirect(url_for(
