@@ -474,6 +474,24 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def get_display_tz_offset_hours():
+    raw = str(os.environ.get("DISPLAY_TZ_OFFSET_HOURS", "8")).strip()
+    try:
+        return float(raw)
+    except Exception:
+        return 8.0
+
+
+def date_str_from_timestamp_in_display_tz(ts, fmt="%Y-%m-%d"):
+    offset_seconds = int(get_display_tz_offset_hours() * 3600)
+    return datetime.utcfromtimestamp(float(ts) + offset_seconds).strftime(fmt)
+
+
+def today_in_display_tz():
+    offset_seconds = int(get_display_tz_offset_hours() * 3600)
+    return datetime.utcfromtimestamp(time.time() + offset_seconds).date()
+
+
 def safe_float(v, default=0.0):
     try:
         if v is None or v == "":
@@ -2291,11 +2309,11 @@ def get_daily_profit_chart_data_from_db(app_id=DEFAULT_APP_ID, keyword="", steam
             continue
         if ts > 10**12:
             ts = ts / 1000.0
-        day_key = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        day_key = date_str_from_timestamp_in_display_tz(ts, "%Y-%m-%d")
         daily[day_key] += profit
 
     safe_days = max(7, min(int(days or 14), 180))
-    today = datetime.utcnow().date()
+    today = today_in_display_tz()
     result = []
     for i in range(safe_days - 1, -1, -1):
         d = today - timedelta(days=i)
@@ -2532,7 +2550,7 @@ def build_daily_profit_chart_data(rows, days=14):
             continue
         if ts > 10**12:
             ts = ts / 1000.0
-        day = datetime.fromtimestamp(ts).strftime("%m-%d")
+        day = date_str_from_timestamp_in_display_tz(ts, "%m-%d")
         daily[day] += safe_float(row.get("profit", 0), 0)
 
     ordered = sorted(daily.items(), key=lambda x: x[0])
